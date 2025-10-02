@@ -42,6 +42,8 @@ from aiogram.types import BotCommand
 from aiogram import Router
 import aiosqlite
 from dotenv import load_dotenv
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 logging.basicConfig(level=logging.INFO)
 
@@ -51,14 +53,13 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # установите в .env
 CURATORS_CSV = os.getenv("CURATORS_CSV", "curators.csv")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
+SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не установлен в переменных окружения")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-router = Router()
-dp.include_router(router)
 
 # ---- Конфигурация заданий (соответствует документу пользователя) ----
 TASKS = [
@@ -150,13 +151,50 @@ async def load_curators_from_csv_if_empty():
                 for row in reader:
                     if not row:
                         continue
-                    fio = row[0].strip()
-                    tg = int(row[1].strip())
+                    cor_row = row[0].split(',')
+                    fio = cor_row[0].strip()
+                    tg = int(cor_row[1].strip())
                     await db.execute("INSERT INTO curators (fio, telegram_id) VALUES (?,?)", (fio, tg))
             # set meta next_curator_idx
             await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('next_curator_idx', '1')")
             await db.commit()
             print("Curators loaded from CSV")
+
+
+async def update_google_sheet():
+    # подключаемся к Google Sheets
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    client = gspread.authorize(creds)
+
+    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    sheet = spreadsheet.sheet1
+
+    # собираем данные из базы
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT tg_id, fio, acad_group, points FROM users")
+        users = await cur.fetchall()
+        rows = []
+        for u in users:
+            tg_id, fio, acad_group, points = u
+            cur2 = await db.execute(
+                "SELECT task_id FROM submissions WHERE user_id=? AND status='accepted'",
+                (tg_id,)
+            )
+            tasks = await cur2.fetchall()
+            task_list = ",".join(str(t[0]) for t in tasks)
+            rows.append([fio, acad_group, points, task_list])
+
+    # формируем таблицу
+    headers = ["ФИО", "Группа", "Баллы", "Выполненные задания"]
+    data = [headers] + rows
+
+    # очищаем и обновляем
+    sheet.clear()
+    sheet.update("A1", data)
 
 
 async def get_next_curator() -> Optional[dict]:
@@ -252,7 +290,7 @@ def curator_check_kb(submission_id: int) -> InlineKeyboardMarkup:
 
 
 # ---- Handlers ----
-@dp.message(Command(commands=["start"]))
+@dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     tg_id = message.from_user.id
     # check if user exists
@@ -437,6 +475,36 @@ async def receive_answer(message: types.Message, state: FSMContext):
             curator_name = 'Не назначен'
 
     await message.answer("Ваш ответ отправлен на проверку куратору.")
+    if curator_tg:
+        # текстовое уведомление
+        text = f"Новый ответ на задание {t['id']}. {t['title']}\n" \
+               f"От участника: {user_name} (id: {user_id})\nSubmission ID: {submission_id}"
+
+        # пересылаем контент
+        if content_type == "text":
+            await bot.send_message(curator_tg, content)
+        elif content_type == "photo":
+            await bot.send_photo(curator_tg, content)
+        elif content_type == "video":
+            await bot.send_video(curator_tg, content)
+        elif content_type == "photo_text":
+            # content = "photo:<file_id>|text:<text>"
+            parts = content.split("|")
+            photo_id = parts[0].split(":")[1]
+            text_msg = parts[1].split(":", 1)[1]
+            await bot.send_photo(curator_tg, photo_id, caption=text_msg)
+
+        # сообщение с кнопками "Зачесть / Не зачесть"
+        await bot.send_message(curator_tg, text, reply_markup=curator_check_kb(submission_id))
+
+        # уведомление о кол-ве непроверенных
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur4 = await db.execute(
+                "SELECT COUNT(*) FROM submissions WHERE status='pending' "
+                "AND user_id IN (SELECT tg_id FROM users WHERE curator_idx=?)",
+                (curator_idx,))
+            pending_count = (await cur4.fetchone())[0]
+            await bot.send_message(curator_tg, f"У вас {pending_count} непроверенных заданий.")
 
     # notify curator
     if curator_tg:
@@ -481,6 +549,7 @@ async def curator_accept(cb: types.CallbackQuery):
     # notify user
     await bot.send_message(user_id, f"Ваше задание {task_id} зачтено ✅. +{points} баллов. Всего баллов: {new_points}.")
     await cb.answer("Задание зачтено")
+    await update_google_sheet()
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith('cur_reject_'))
@@ -494,48 +563,11 @@ async def curator_reject(cb: types.CallbackQuery):
                          (str(submission_id),))
         await db.commit()
     await cb.answer()
-
-
-@dp.message()
-async def handle_curator_reject_reason(message: types.Message):
-    print("DEBUG MSG:", message.text)
-    await message.answer(f"Я получил: {message.text}")
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT value FROM meta WHERE key='cur_reject_submission'")
-        row = await cur.fetchone()
-
-        # если нет ожидания комментария от куратора — выходим
-        if not row:
-            return
-
-        submission_id = int(row[0])
-        cur2 = await db.execute("SELECT user_id FROM submissions WHERE id=?", (submission_id,))
-        s = await cur2.fetchone()
-        if not s:
-            await message.answer("Субмишн не найден")
-            return
-
-        user_id = s[0]
-        now = datetime.utcnow().isoformat()
-
-        await db.execute(
-            "UPDATE submissions SET status='rejected', curator_comment=?, updated_at=? WHERE id=?",
-            (message.text, now, submission_id)
-        )
-        await db.execute("DELETE FROM meta WHERE key='cur_reject_submission'")
-        await db.commit()
-
-    # уведомляем пользователя
-    await bot.send_message(
-        user_id,
-        f"Вам не зачли задание ❌.\nПричина: {message.text}\n"
-        "Вы можете отправить новое решение этого задания."
-    )
-    await message.answer("Комментарий отправлен участнику.")
+    await update_google_sheet()
 
 
 # Профиль пользователя
-@dp.message(Command(commands=['profile']))
+@dp.message(Command("profile"))
 async def cmd_profile(message: types.Message):
     tg = message.from_user.id
     async with aiosqlite.connect(DB_PATH) as db:
@@ -557,7 +589,7 @@ async def cmd_profile(message: types.Message):
 
 
 # Команда админа посмотреть статистику кураторов
-@dp.message(Command(commands=['stats']))
+@dp.message(Command('stats'))
 async def cmd_stats(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("Команда доступна только администратору")
@@ -576,42 +608,123 @@ async def cmd_stats(message: types.Message):
     await message.answer("\n".join(lines) if lines else "Кураторы не найдены")
 
 
+def export_to_google_sheets(rows: list[list]):
+    """
+    rows: список списков, где каждая строка — это данные пользователя
+    формат: [ФИО, Группа, Баллы, Список заданий]
+    """
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    client = gspread.authorize(creds)
+
+    # Открываем таблицу
+    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    sheet = spreadsheet.sheet1
+
+    # Заголовки + данные
+    headers = ["ФИО", "Группа", "Баллы", "Выполненные задания"]
+    data = [headers] + rows
+
+    # Чистим и записываем всё за раз
+    sheet.clear()
+    sheet.update("A1", data)
+
+    # ничего не возвращаем
+    return None
+
+
 # Экспорт рейтинга в Google Sheets (заготовка)
-@dp.message(Command(commands=['export']))
+@dp.message(Command('export'))
 async def cmd_export(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("Только администратор")
         return
-    # Составим таблицу: фио, группа, баллы, номера заданий
+
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT tg_id, fio, acad_group, points FROM users")
         users = await cur.fetchall()
         rows = []
         for u in users:
             tg_id, fio, acad_group, points = u
-            cur2 = await db.execute("SELECT task_id FROM submissions WHERE user_id=? AND status='accepted'", (tg_id,))
+            cur2 = await db.execute(
+                "SELECT task_id FROM submissions WHERE user_id=? AND status='accepted'",
+                (tg_id,)
+            )
             tasks = await cur2.fetchall()
             task_list = ",".join(str(t[0]) for t in tasks)
             rows.append([fio, acad_group, points, task_list])
-    # здесь можно интегрировать с Google Sheets (gspread) — код опущен, добавьте свои креды
-    await message.answer(
-        "Экспорт составлен (локально). Реализация загрузки в Google Sheets требует настройки API и credentials.json.")
+
+    try:
+        loop = asyncio.get_event_loop()
+        # Запускаем синхронную функцию в отдельном потоке
+        await loop.run_in_executor(None, export_to_google_sheets, rows)
+        await message.answer("Экспорт выполнен ✅. Данные обновлены в Google Sheets.")
+    except Exception as e:
+        await message.answer(f"Ошибка при экспорте: {type(e)} {e}")
 
 
 # список заданий
-@router.message(Command("tasks"))
+@dp.message(Command("tasks"))
 async def cmd_tasks(message: types.Message):
     await message.answer(
         "Выберите задание:",
         reply_markup=tasks_keyboard_for_user(message.from_user.id)
     )
-    print(12345678)
 
 
-@router.message(Command("menu"))
+@dp.message(Command("menu"))
 async def cmd_menu(message: types.Message):
     # просто вызываем обработчик tasks
     await cmd_tasks(message)
+
+
+@dp.message()
+async def handle_curator_reject_reason(message: types.Message):
+    # 1) если это команда — НЕ обрабатываем здесь (чтобы команды шли дальше)
+    if message.entities:
+        for ent in message.entities:
+            if ent.type == "bot_command":
+                print(123456745676543)
+                return  # отдаем команду другим хендлерам
+
+    # 2) Проверяем, есть ли реально ожидающее отклонение
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT value FROM meta WHERE key='cur_reject_submission'")
+        row = await cur.fetchone()
+        if not row:
+            return  # ничего не ждем — не перехватываем сообщение
+
+        submission_id = int(row[0])
+        cur2 = await db.execute("SELECT user_id FROM submissions WHERE id=?", (submission_id,))
+        s = await cur2.fetchone()
+        if not s:
+            await message.answer("Субмишн не найден")
+            # удалим флаг, чтобы не застрять (опционально)
+            await db.execute("DELETE FROM meta WHERE key='cur_reject_submission'")
+            await db.commit()
+            return
+
+        user_id = s[0]
+        now = datetime.utcnow().isoformat()
+
+        await db.execute(
+            "UPDATE submissions SET status='rejected', curator_comment=?, updated_at=? WHERE id=?",
+            (message.text, now, submission_id)
+        )
+        await db.execute("DELETE FROM meta WHERE key='cur_reject_submission'")
+        await db.commit()
+
+    # уведомляем участника
+    await bot.send_message(
+        user_id,
+        f"Вам не зачли задание ❌.\nПричина: {message.text}\n"
+        "Вы можете отправить новое решение этого задания."
+    )
+    await message.answer("Комментарий отправлен участнику.")
+
 
 async def on_startup(dp):
     await init_db()
@@ -626,13 +739,14 @@ async def on_startup(dp):
     ]
     await bot.set_my_commands(commands)
 
+
 # Запуск
 async def main():
     await init_db()
     await load_curators_from_csv_if_empty()
+    await on_startup(dp)
     print("Bot started")
     try:
-        await on_startup(dp)
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
