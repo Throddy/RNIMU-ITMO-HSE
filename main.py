@@ -39,11 +39,14 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import BotCommand
+from aiogram import F
 from aiogram import Router
 import aiosqlite
 from dotenv import load_dotenv
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from aiogram.exceptions import TelegramBadRequest
+import secrets
 
 logging.basicConfig(level=logging.INFO)
 
@@ -54,6 +57,8 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # установите в .env
 CURATORS_CSV = os.getenv("CURATORS_CSV", "curators.csv")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
+SPREADSHEET_NAME = "Староста года"  # название таблицы
+SHEET_NAME = "Рейтинг"  # лист для рейтинга
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не установлен в переменных окружения")
@@ -79,15 +84,32 @@ TASKS = [
 ]
 
 
-def tasks_keyboard_for_user(user_id: int) -> InlineKeyboardMarkup:
+async def tasks_keyboard_for_user(user_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Получаем id задач, которые уже выполнены или на проверке
+        cur = await db.execute(
+            "SELECT task_id, status FROM submissions WHERE user_id=? AND status IN ('pending', 'accepted')",
+            (user_id,)
+        )
+        done_or_pending = [r[0] for r in await cur.fetchall()]
+
+    # Формируем кнопки только для доступных заданий
     for t in TASKS:
+        if t['id'] in done_or_pending:
+            continue  # скрываем выполненные и отправленные
         builder.button(
             text=f"{t['id']}. {t['title']}",
             callback_data=f"task_{t['id']}"
         )
-    builder.adjust(2)  # количество кнопок в ряд
+
+    if not builder.buttons:
+        builder.button(text="🎉 Все задания выполнены!", callback_data="no_tasks")
+
+    builder.adjust(2)
     return builder.as_markup()
+
 
 
 # ---- FSM States ----
@@ -98,6 +120,11 @@ class StartStates(StatesGroup):
 
 class SubmitStates(StatesGroup):
     waiting_for_answer = State()
+
+
+class AnswerFSM(StatesGroup):
+    waiting_for_photo = State()
+    waiting_for_text = State()
 
 
 # ---- Database helpers ----
@@ -259,18 +286,6 @@ async def submission_accepted_for_task(user_id: int, task_id: int) -> bool:
         return r[0] > 0
 
 
-# ---- Keyboards ----
-def tasks_keyboard_for_user(user_id: int) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    for t in TASKS:
-        builder.button(
-            text=f"{t['id']}. {t['title']}",
-            callback_data=f"task_{t['id']}"
-        )
-    builder.adjust(2)  # по 2 кнопки в ряд
-    return builder.as_markup()
-
-
 def task_action_keyboard(task_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="Отправить ответ", callback_data=f"send_{task_id}")
@@ -292,20 +307,96 @@ def curator_check_kb(submission_id: int) -> InlineKeyboardMarkup:
 # ---- Handlers ----
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
+    args = message.text.split(maxsplit=1)
+    if len(args) > 1 and args[1].startswith("curator_invite_"):
+        token = args[1].replace("curator_invite_", "")
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT value FROM meta WHERE key=?", (f"curator_token_{token}",))
+            row = await cur.fetchone()
+            if not row or row[0] != "valid":
+                await message.answer("❌ Ссылка недействительна или уже использована.")
+                return
+
+            # Добавляем пользователя как куратора, если его ещё нет
+            cur2 = await db.execute("SELECT COUNT(*) FROM curators WHERE telegram_id=?", (message.from_user.id,))
+            count = (await cur2.fetchone())[0]
+            if count == 0:
+                fio = message.from_user.full_name
+                await db.execute("INSERT INTO curators (fio, telegram_id) VALUES (?, ?)", (fio, message.from_user.id))
+                await db.commit()
+                await message.answer(f"✅ Вы успешно добавлены в список кураторов, {fio}!")
+            else:
+                await message.answer("✅ Вы уже есть в списке кураторов.")
+
+            # Можно сделать, чтобы ссылка была одноразовой:
+            await db.execute("DELETE FROM meta WHERE key=?", (f"curator_token_{token}",))
+            await db.commit()
+        return
+
+    # Если не приглашение — обычная регистрация
     tg_id = message.from_user.id
-    # check if user exists
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT fio FROM users WHERE tg_id=?", (tg_id,))
         r = await cur.fetchone()
         if r:
             await message.answer(
                 "Вы уже зарегистрированы. Вот список заданий:",
-                reply_markup=tasks_keyboard_for_user(tg_id)
+                reply_markup=await tasks_keyboard_for_user(tg_id)
             )
             return
     await message.answer(
-        "Привет! Добро пожаловать в бот конкурса 'Староста года'! Для начала напишите, пожалуйста, свое ФИО.")
+        "Привет! Добро пожаловать в бот конкурса 'Староста года'! Для начала напишите, пожалуйста, свое ФИО."
+    )
     await state.set_state(StartStates.waiting_for_fio)
+
+
+
+@dp.message(Command("gen_curator_link"))
+async def gen_curator_link(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Эта команда доступна только администратору.")
+        return
+
+    token = secrets.token_urlsafe(8)
+    link = f"https://t.me/{(await bot.me()).username}?start=curator_invite_{token}"
+
+    # можно сохранить токен в БД, если хочешь ограничить срок действия
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (f"curator_token_{token}", "valid"),
+        )
+        await db.commit()
+
+    await message.answer(f"🔗 Ссылка для добавления куратора:\n{link}")
+
+
+@dp.message(Command("export"))
+async def cmd_export(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Команда доступна только администратору.")
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, lambda: asyncio.run(export_to_google_sheets()))
+        await message.answer("✅ Рейтинг успешно экспортирован в Google Sheets.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при экспорте: {e}")
+
+
+# список заданий
+@dp.message(Command("tasks"))
+async def cmd_tasks(message: types.Message):
+    await message.answer(
+        "Выберите задание:",
+        reply_markup=await tasks_keyboard_for_user(message.from_user.id)
+    )
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: types.Message):
+    # просто вызываем обработчик tasks
+    await cmd_tasks(message)
 
 
 @dp.message(StartStates.waiting_for_fio)
@@ -344,7 +435,10 @@ async def process_group(message: types.Message, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith('back_to_tasks'))
 async def back_to_tasks(cb: types.CallbackQuery):
-    await cb.message.edit_text("Вот список заданий:", reply_markup=tasks_keyboard_for_user(cb.from_user.id))
+    await cb.message.edit_text(
+        "Вот список заданий:",
+        reply_markup=await tasks_keyboard_for_user(cb.from_user.id)
+    )
     await cb.answer()
 
 
@@ -395,12 +489,92 @@ async def on_send_answer(cb: types.CallbackQuery, state: FSMContext):
         if accepted_count < 3:
             await cb.answer("Супер-задание доступно только после выполнения как минимум 3 заданий.", show_alert=True)
             return
+    t = task_by_id(task_id)
+    if t["type"] == "photo_text":
+        await state.set_state(AnswerFSM.waiting_for_photo)
+        await state.update_data(task_id=task_id)
+        await cb.message.answer("📸 Отправьте фото для этого задания:")
+        await cb.answer()
+        return
     await state.update_data(task_id=task_id)
     await cb.message.answer("Отправьте ответ в нужном формате (текст/фото/видео):")
     await state.set_state(SubmitStates.waiting_for_answer)
     await cb.answer()
 
 
+@dp.message(AnswerFSM.waiting_for_photo, F.photo)
+async def handle_photo_for_task(message: types.Message, state: FSMContext):
+    await state.update_data(photo_id=message.photo[-1].file_id)
+    await state.set_state(AnswerFSM.waiting_for_text)
+    await message.answer("✍ Теперь отправьте текстовое пояснение:")
+
+
+@dp.message(AnswerFSM.waiting_for_text, F.text)
+async def handle_text_for_task(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    task_id = data["task_id"]
+    user_id = message.from_user.id
+    photo_id = data["photo_id"]
+    text = message.text.strip()
+
+    content_type = "photo_text"
+    content = f"photo:{photo_id}|text:{text}"
+    now = datetime.utcnow().isoformat()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO submissions (user_id, task_id, status, content_type, content, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (user_id, task_id, 'pending', content_type, content, now, now),
+        )
+        await db.commit()
+        cur2 = await db.execute("SELECT curator_idx, fio FROM users WHERE tg_id=?", (user_id,))
+        u = await cur2.fetchone()
+        curator_idx, user_name = u[0], u[1]
+        cur3 = await db.execute("SELECT telegram_id FROM curators WHERE idx=?", (curator_idx,))
+        c = await cur3.fetchone()
+        curator_tg = c[0] if c else None
+
+    await message.answer("✅ Ваш ответ отправлен куратору.")
+    if curator_tg:
+        await notify_curator_new_answer(curator_tg, curator_idx)
+
+    await state.clear()
+
+
+# ===== клавиатура для начала проверки =====
+def curator_start_check_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Начать проверку ▶️", callback_data="curator_start_check")
+    return builder.as_markup()
+
+
+# ===== клавиатура для куратора при проверке =====
+def curator_check_kb(submission_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Зачесть ✅", callback_data=f"cur_accept_{submission_id}")
+    builder.button(text="Не зачесть ❌", callback_data=f"cur_reject_{submission_id}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+# ===== при появлении нового ответа от студента =====
+async def notify_curator_new_answer(curator_tg: int, curator_idx: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM submissions WHERE status='pending' "
+            "AND user_id IN (SELECT tg_id FROM users WHERE curator_idx=?)",
+            (curator_idx,))
+        pending_count = (await cur.fetchone())[0]
+
+    await bot.send_message(
+        curator_tg,
+        f"У вас новый ответ от участника!\nНепроверенных: {pending_count}",
+        reply_markup=curator_start_check_kb()
+    )
+
+
+# ===== студент отправил ответ =====
 @dp.message(SubmitStates.waiting_for_answer)
 async def receive_answer(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -409,161 +583,212 @@ async def receive_answer(message: types.Message, state: FSMContext):
     t = task_by_id(task_id)
     required = t['type']
 
-    # helper to determine message type
     is_text = bool(message.text and message.text.strip())
     is_photo = bool(message.photo)
     is_video = bool(message.video or message.video_note)
 
     valid = False
-    content_type = None
-    content = None
+    content_type, content = None, None
 
-    # Validate according to required types
     if required == 'text' and is_text:
         valid = True
-        content_type = 'text'
-        content = message.text.strip()
+        content_type, content = 'text', message.text.strip()
     elif required in ('photo', 'photo_text', 'photo_multi') and is_photo:
         valid = True
-        content_type = 'photo'
-        # save file_id of largest photo
-        content = message.photo[-1].file_id
-        if required == 'photo_multi':
-            # for photo_multi we might need multiple photos — simplified: accept single for now
-            pass
+        content_type, content = 'photo', message.photo[-1].file_id
     elif required == 'video' and is_video:
         valid = True
-        content_type = 'video'
-        content = (message.video or message.video_note).file_id
+        content_type, content = 'video', (message.video or message.video_note).file_id
     elif required == 'photo_video' and (is_photo or is_video):
         valid = True
-        content_type = 'photo' if is_photo else 'video'
-        content = message.photo[-1].file_id if is_photo else message.video.file_id
+        if is_photo:
+            content_type, content = 'photo', message.photo[-1].file_id
+        else:
+            content_type, content = 'video', message.video.file_id
     elif required == 'photo_text' and (is_photo and is_text):
         valid = True
         content_type = 'photo_text'
         content = f"photo:{message.photo[-1].file_id}|text:{message.text.strip()}"
 
     if not valid:
-        await message.answer("Неподходящий тип ответа. Пожалуйста, отправьте ответ в требуемом формате.")
+        await message.answer("Неподходящий тип ответа. Пожалуйста, отправьте в правильном формате.")
         return
 
-    # insert submission as pending
     now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO submissions (user_id, task_id, status, content_type, content, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO submissions (user_id, task_id, status, content_type, content, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?)",
             (user_id, task_id, 'pending', content_type, content, now, now),
         )
         await db.commit()
-        cur = await db.execute("SELECT last_insert_rowid()")
-        row = await cur.fetchone()
-        submission_id = row[0]
-        # get user's curator
+
+        # получаем куратора
         cur2 = await db.execute("SELECT curator_idx, fio FROM users WHERE tg_id=?", (user_id,))
         u = await cur2.fetchone()
-        curator_idx = u[0]
-        user_name = u[1]
-        # get curator telegram id
-        cur3 = await db.execute("SELECT telegram_id, fio FROM curators WHERE idx=?", (curator_idx,))
+        curator_idx, user_name = u[0], u[1]
+        cur3 = await db.execute("SELECT telegram_id FROM curators WHERE idx=?", (curator_idx,))
         c = await cur3.fetchone()
-        if c:
-            curator_tg = c[0]
-            curator_name = c[1]
-        else:
-            curator_tg = None
-            curator_name = 'Не назначен'
+        curator_tg = c[0] if c else None
 
     await message.answer("Ваш ответ отправлен на проверку куратору.")
+
     if curator_tg:
-        # текстовое уведомление
-        text = f"Новый ответ на задание {t['id']}. {t['title']}\n" \
-               f"От участника: {user_name} (id: {user_id})\nSubmission ID: {submission_id}"
-
-        # пересылаем контент
-        if content_type == "text":
-            await bot.send_message(curator_tg, content)
-        elif content_type == "photo":
-            await bot.send_photo(curator_tg, content)
-        elif content_type == "video":
-            await bot.send_video(curator_tg, content)
-        elif content_type == "photo_text":
-            # content = "photo:<file_id>|text:<text>"
-            parts = content.split("|")
-            photo_id = parts[0].split(":")[1]
-            text_msg = parts[1].split(":", 1)[1]
-            await bot.send_photo(curator_tg, photo_id, caption=text_msg)
-
-        # сообщение с кнопками "Зачесть / Не зачесть"
-        await bot.send_message(curator_tg, text, reply_markup=curator_check_kb(submission_id))
-
-        # уведомление о кол-ве непроверенных
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur4 = await db.execute(
-                "SELECT COUNT(*) FROM submissions WHERE status='pending' "
-                "AND user_id IN (SELECT tg_id FROM users WHERE curator_idx=?)",
-                (curator_idx,))
-            pending_count = (await cur4.fetchone())[0]
-            await bot.send_message(curator_tg, f"У вас {pending_count} непроверенных заданий.")
-
-    # notify curator
-    if curator_tg:
-        text = f"Новый ответ на задание {t['id']}. {t['title']}\nОт участника: {user_name} (id: {user_id})\nSubmission ID: {submission_id}"
-        # for simplicity, we send a short message and action buttons
-        await bot.send_message(curator_tg, text, reply_markup=curator_check_kb(submission_id))
-        # also notify curator about количество непроверенных
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur4 = await db.execute(
-                "SELECT COUNT(*) FROM submissions WHERE status='pending' AND user_id IN (SELECT tg_id FROM users WHERE curator_idx=?)",
-                (curator_idx,))
-            pending_count = (await cur4.fetchone())[0]
-            await bot.send_message(curator_tg, f"У вас {pending_count} непроверенных заданий.")
-    else:
-        await message.answer("Внимание: для вашего пользователя куратор не назначен, администратор должен назначить.")
+        await notify_curator_new_answer(curator_tg, curator_idx)
 
     await state.clear()
 
 
-# Curator actions
-@dp.callback_query(lambda c: c.data and c.data.startswith('cur_accept_'))
+# ===== куратор нажал 'Начать проверку' =====
+@dp.callback_query(lambda c: c.data == "curator_start_check")
+async def curator_start_check(cb: types.CallbackQuery):
+    await send_next_submission_to_curator(cb.from_user.id)
+    await cb.answer()
+
+
+# ===== выдаём куратору следующий ответ =====
+async def send_next_submission_to_curator(curator_tg: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT s.id, s.user_id, s.task_id, s.content_type, s.content, u.fio
+            FROM submissions s
+            JOIN users u ON u.tg_id = s.user_id
+            WHERE s.status='pending' 
+              AND u.curator_idx=(SELECT idx FROM curators WHERE telegram_id=?)
+            ORDER BY s.created_at ASC
+            LIMIT 1
+        """, (curator_tg,))
+        row = await cur.fetchone()
+
+    if not row:
+        await bot.send_message(curator_tg, "Все задания проверены ✅")
+        asyncio.create_task(export_to_google_sheets())
+        return
+
+    submission_id, user_id, task_id, content_type, content, user_name = row
+    t = task_by_id(task_id)
+
+    # отправляем контент
+    if content_type == "text":
+        await bot.send_message(curator_tg, content)
+    elif content_type == "photo":
+        await bot.send_photo(curator_tg, content)
+    elif content_type == "video":
+        await bot.send_video(curator_tg, content)
+    elif content_type == "photo_text":
+        parts = content.split("|")
+        photo_id = parts[0].split(":")[1]
+        text_msg = parts[1].split(":", 1)[1]
+        await bot.send_photo(curator_tg, photo_id, caption=text_msg)
+
+    # инфо + кнопки
+    text = (
+        f"Задание {t['id']}. {t['title']}\n"
+        f"От участника: {user_name} (id: {user_id})\n"
+        f"Submission ID: {submission_id}"
+    )
+    await bot.send_message(curator_tg, text, reply_markup=curator_check_kb(submission_id))
+
+
+# ===== куратор зачёл =====
+@dp.callback_query(lambda c: c.data.startswith("cur_accept_"))
 async def curator_accept(cb: types.CallbackQuery):
     submission_id = int(cb.data.split('_')[-1])
     curator_tg = cb.from_user.id
     now = datetime.utcnow().isoformat()
+
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, task_id FROM submissions WHERE id=?", (submission_id,))
-        s = await cur.fetchone()
-        if not s:
-            await cb.answer("Заявка не найдена")
+        cur = await db.execute("SELECT user_id, task_id, status FROM submissions WHERE id=?", (submission_id,))
+        row = await cur.fetchone()
+        if not row:
+            await cb.answer("Задание не найдено", show_alert=True)
             return
-        user_id, task_id = s
-        # update status
+
+        user_id, task_id, status = row
+        if status != "pending":
+            await cb.answer("Это задание уже проверено ⚠️", show_alert=True)
+            return
+
+        # обновляем статус
         await db.execute("UPDATE submissions SET status='accepted', updated_at=? WHERE id=?", (now, submission_id))
-        # add points to user
         points = task_by_id(task_id)['points']
         await db.execute("UPDATE users SET points = points + ? WHERE tg_id=?", (points, user_id))
         await db.commit()
-        # count new total
+
         cur2 = await db.execute("SELECT points FROM users WHERE tg_id=?", (user_id,))
         new_points = (await cur2.fetchone())[0]
-    # notify user
-    await bot.send_message(user_id, f"Ваше задание {task_id} зачтено ✅. +{points} баллов. Всего баллов: {new_points}.")
-    await cb.answer("Задание зачтено")
-    await update_google_sheet()
+
+    # уведомляем участника
+    await bot.send_message(user_id, f"Ваше задание {task_id} зачтено ✅. +{points} баллов. Всего: {new_points}")
+
+    # удаляем кнопки из старого сообщения
+    try:
+        await cb.message.edit_reply_markup()
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            pass
+        else:
+            raise
+
+    await cb.answer("Задание зачтено ✅")
+
+    # переходим к следующему
+    await send_next_submission_to_curator(curator_tg)
 
 
-@dp.callback_query(lambda c: c.data and c.data.startswith('cur_reject_'))
-async def curator_reject(cb: types.CallbackQuery):
+# ===== куратор отклонил =====
+@dp.callback_query(lambda c: c.data.startswith("cur_reject_"))
+async def curator_reject(cb: types.CallbackQuery, state: FSMContext):
     submission_id = int(cb.data.split('_')[-1])
-    curator_tg = cb.from_user.id
-    await cb.message.answer("Напишите, пожалуйста, причину отказа. Это сообщение будет отправлено участнику.")
-    # store in tmp meta which submission curator is rejecting
+
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('cur_reject_submission', ?)",
-                         (str(submission_id),))
-        await db.commit()
+        cur = await db.execute("SELECT status FROM submissions WHERE id=?", (submission_id,))
+        row = await cur.fetchone()
+        if not row:
+            await cb.answer("Задание не найдено", show_alert=True)
+            return
+
+        status = row[0]
+        if status != "pending":
+            await cb.answer("Это задание уже проверено ⚠️", show_alert=True)
+            return
+
+    # убираем клавиатуру, чтобы нельзя было жать повторно
+    try:
+        await cb.message.edit_reply_markup()
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            pass
+        else:
+            raise
+
+    await cb.message.answer("Напишите причину отказа:")
+    await state.update_data(reject_submission=submission_id)
     await cb.answer()
-    await update_google_sheet()
+
+
+@dp.message()
+async def handle_curator_reject_reason(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    submission_id = data.get("reject_submission")
+    if not submission_id:
+        return  # это обычное сообщение, не причина отклонения
+
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id, task_id FROM submissions WHERE id=?", (submission_id,))
+        user_id, task_id = await cur.fetchone()
+        await db.execute(
+            "UPDATE submissions SET status='rejected', curator_comment=?, updated_at=? WHERE id=?",
+            (message.text, now, submission_id))
+        await db.commit()
+
+    await bot.send_message(user_id, f"Ваше задание {task_id} не зачтено ❌\nПричина: {message.text}")
+    await message.answer("Комментарий отправлен участнику ✅")
+    await state.clear()
+
+    # после отклонения → следующее задание
+    await send_next_submission_to_curator(message.from_user.id)
 
 
 # Профиль пользователя
@@ -608,122 +833,62 @@ async def cmd_stats(message: types.Message):
     await message.answer("\n".join(lines) if lines else "Кураторы не найдены")
 
 
-def export_to_google_sheets(rows: list[list]):
-    """
-    rows: список списков, где каждая строка — это данные пользователя
-    формат: [ФИО, Группа, Баллы, Список заданий]
-    """
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive"
-    ]
+def get_gs_client():
+    scope = ["https://spreadsheets.google.com/feeds",
+             "https://www.googleapis.com/auth/spreadsheets",
+             "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-    client = gspread.authorize(creds)
-
-    # Открываем таблицу
-    spreadsheet = client.open_by_key(SPREADSHEET_ID)
-    sheet = spreadsheet.sheet1
-
-    # Заголовки + данные
-    headers = ["ФИО", "Группа", "Баллы", "Выполненные задания"]
-    data = [headers] + rows
-
-    # Чистим и записываем всё за раз
-    sheet.clear()
-    sheet.update("A1", data)
-
-    # ничего не возвращаем
-    return None
+    return gspread.authorize(creds)
 
 
-# Экспорт рейтинга в Google Sheets (заготовка)
-@dp.message(Command('export'))
-async def cmd_export(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("Только администратор")
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT tg_id, fio, acad_group, points FROM users")
-        users = await cur.fetchall()
-        rows = []
-        for u in users:
-            tg_id, fio, acad_group, points = u
-            cur2 = await db.execute(
-                "SELECT task_id FROM submissions WHERE user_id=? AND status='accepted'",
-                (tg_id,)
-            )
-            tasks = await cur2.fetchall()
-            task_list = ",".join(str(t[0]) for t in tasks)
-            rows.append([fio, acad_group, points, task_list])
-
+async def export_to_google_sheets():
     try:
-        loop = asyncio.get_event_loop()
-        # Запускаем синхронную функцию в отдельном потоке
-        await loop.run_in_executor(None, export_to_google_sheets, rows)
-        await message.answer("Экспорт выполнен ✅. Данные обновлены в Google Sheets.")
+        client = get_gs_client()
+
+        try:
+            spreadsheet = client.open(SPREADSHEET_NAME)
+        except gspread.SpreadsheetNotFound:
+            spreadsheet = client.create(SPREADSHEET_NAME)
+            spreadsheet.share('', perm_type='anyone', role='writer')
+
+        try:
+            sheet = spreadsheet.worksheet(SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            sheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows="300", cols="20")
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT tg_id, fio, acad_group, points FROM users")
+            users = await cur.fetchall()
+            rows = []
+            for u in users:
+                tg_id, fio, acad_group, points = u
+                cur2 = await db.execute(
+                    "SELECT task_id FROM submissions WHERE user_id=? AND status='accepted'", (tg_id,))
+                tasks = await cur2.fetchall()
+                task_list = ",".join(str(t[0]) for t in tasks)
+                rows.append([fio, acad_group, points, task_list])
+
+        # сортировка по баллам
+        rows.sort(key=lambda r: r[2], reverse=True)
+
+        # добавляем места
+        rows_with_rank = []
+        rank = 1
+        for i, row in enumerate(rows):
+            if i > 0 and row[2] < rows[i - 1][2]:
+                rank = i + 1
+            rows_with_rank.append([rank] + row)
+
+        header = ["Место", "ФИО", "Группа", "Баллы", "Выполненные задания"]
+
+        sheet.clear()
+        sheet.update(values=[header] + rows_with_rank, range_name="A1")
+
+        logging.info("✅ Google Sheets обновлены (автоматически).")
+
     except Exception as e:
-        await message.answer(f"Ошибка при экспорте: {type(e)} {e}")
+        logging.error(f"❌ Ошибка при обновлении Google Sheets: {e}")
 
-
-# список заданий
-@dp.message(Command("tasks"))
-async def cmd_tasks(message: types.Message):
-    await message.answer(
-        "Выберите задание:",
-        reply_markup=tasks_keyboard_for_user(message.from_user.id)
-    )
-
-
-@dp.message(Command("menu"))
-async def cmd_menu(message: types.Message):
-    # просто вызываем обработчик tasks
-    await cmd_tasks(message)
-
-
-@dp.message()
-async def handle_curator_reject_reason(message: types.Message):
-    # 1) если это команда — НЕ обрабатываем здесь (чтобы команды шли дальше)
-    if message.entities:
-        for ent in message.entities:
-            if ent.type == "bot_command":
-                print(123456745676543)
-                return  # отдаем команду другим хендлерам
-
-    # 2) Проверяем, есть ли реально ожидающее отклонение
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT value FROM meta WHERE key='cur_reject_submission'")
-        row = await cur.fetchone()
-        if not row:
-            return  # ничего не ждем — не перехватываем сообщение
-
-        submission_id = int(row[0])
-        cur2 = await db.execute("SELECT user_id FROM submissions WHERE id=?", (submission_id,))
-        s = await cur2.fetchone()
-        if not s:
-            await message.answer("Субмишн не найден")
-            # удалим флаг, чтобы не застрять (опционально)
-            await db.execute("DELETE FROM meta WHERE key='cur_reject_submission'")
-            await db.commit()
-            return
-
-        user_id = s[0]
-        now = datetime.utcnow().isoformat()
-
-        await db.execute(
-            "UPDATE submissions SET status='rejected', curator_comment=?, updated_at=? WHERE id=?",
-            (message.text, now, submission_id)
-        )
-        await db.execute("DELETE FROM meta WHERE key='cur_reject_submission'")
-        await db.commit()
-
-    # уведомляем участника
-    await bot.send_message(
-        user_id,
-        f"Вам не зачли задание ❌.\nПричина: {message.text}\n"
-        "Вы можете отправить новое решение этого задания."
-    )
-    await message.answer("Комментарий отправлен участнику.")
 
 
 async def on_startup(dp):
