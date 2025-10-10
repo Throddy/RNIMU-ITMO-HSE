@@ -30,6 +30,7 @@ import os
 from datetime import datetime
 from typing import List, Optional
 import logging
+import json
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -53,12 +54,19 @@ logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # установите в .env
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else []
 CURATORS_CSV = os.getenv("CURATORS_CSV", "curators.csv")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
 SPREADSHEET_NAME = "Староста года"  # название таблицы
 SHEET_NAME = "Рейтинг"  # лист для рейтинга
+TASKS_JSON_PATH = "tasks_data.json"
+
+if not os.path.exists(TASKS_JSON_PATH):
+    raise FileNotFoundError(f"Файл {TASKS_JSON_PATH} не найден")
+
+with open(TASKS_JSON_PATH, "r", encoding="utf-8") as f:
+    TASKS_DETAILS = {task["id"]: task for task in json.load(f)}
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не установлен в переменных окружения")
@@ -68,10 +76,10 @@ dp = Dispatcher(storage=MemoryStorage())
 
 # ---- Конфигурация заданий (соответствует документу пользователя) ----
 TASKS = [
-    {"id": 1, "title": "Знакомство", "type": "photo_text", "points": 1},
+    {"id": 1, "title": "Знакомство", "type": "text", "points": 1},
     {"id": 2, "title": "Важные сведения", "type": "text", "points": 1},
     {"id": 3, "title": "Документы и не только", "type": "text", "points": 1},
-    {"id": 4, "title": "Дни варенья", "type": "text_photo", "points": 1},
+    {"id": 4, "title": "Дни варенья", "type": "text", "points": 1},
     {"id": 5, "title": "Памятный кадр", "type": "photo", "points": 2},
     {"id": 6, "title": "Фото со звездой", "type": "photo", "points": 2},
     {"id": 7, "title": "Нетворкинг", "type": "photo_multi", "points": 2},
@@ -109,7 +117,6 @@ async def tasks_keyboard_for_user(user_id: int) -> InlineKeyboardMarkup:
 
     builder.adjust(2)
     return builder.as_markup()
-
 
 
 # ---- FSM States ----
@@ -350,10 +357,161 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await state.set_state(StartStates.waiting_for_fio)
 
 
+# ===== Временное хранилище подтверждений =====
+pending_deletions = {}
+
+
+def confirm_keyboard(entity_type: str, entity_id: int) -> InlineKeyboardMarkup:
+    """Создаёт клавиатуру подтверждения удаления."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Подтвердить", callback_data=f"confirm_delete_{entity_type}_{entity_id}")
+    kb.button(text="❌ Отмена", callback_data="cancel_delete")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+# === Команда: удалить пользователя ===
+@dp.message(Command("delete_user"))
+async def cmd_delete_user(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ Команда доступна только администратору.")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("📋 Использование: `/delete_user <telegram_id>`", parse_mode="Markdown")
+        return
+
+    try:
+        user_id = int(args[1])
+    except ValueError:
+        await message.answer("⚠️ Укажите корректный Telegram ID пользователя.")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT fio, acad_group FROM users WHERE tg_id=?", (user_id,))
+        user = await cur.fetchone()
+
+    if not user:
+        await message.answer("❌ Пользователь с таким ID не найден.")
+        return
+
+    fio, group = user
+    pending_deletions[message.from_user.id] = {"type": "user", "id": user_id}
+
+    await message.answer(
+        f"Вы уверены, что хотите удалить пользователя *{fio} ({group})*?",
+        parse_mode="Markdown",
+        reply_markup=confirm_keyboard("user", user_id)
+    )
+
+
+# === Команда: удалить куратора ===
+@dp.message(Command("delete_curator"))
+async def cmd_delete_curator(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ Команда доступна только администратору.")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("📋 Использование: `/delete_curator <telegram_id>`", parse_mode="Markdown")
+        return
+
+    try:
+        curator_tg = int(args[1])
+    except ValueError:
+        await message.answer("⚠️ Укажите корректный Telegram ID куратора.")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT fio FROM curators WHERE telegram_id=?", (curator_tg,))
+        row = await cur.fetchone()
+
+    if not row:
+        await message.answer("❌ Куратор с таким ID не найден.")
+        return
+
+    fio = row[0]
+    pending_deletions[message.from_user.id] = {"type": "curator", "id": curator_tg}
+
+    await message.answer(
+        f"Вы уверены, что хотите удалить куратора *{fio}* (ID {curator_tg})?\n"
+        f"Все его участники будут переназначены другим кураторам.",
+        parse_mode="Markdown",
+        reply_markup=confirm_keyboard("curator", curator_tg)
+    )
+
+
+# === Обработка подтверждения удаления ===
+@dp.callback_query(lambda c: c.data.startswith("confirm_delete_"))
+async def confirm_deletion(cb: types.CallbackQuery):
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    parts = cb.data.split("_")
+    entity_type = parts[2]
+    entity_id = int(parts[3])
+
+    if entity_type == "user":
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Удаляем данные пользователя
+            await db.execute("DELETE FROM submissions WHERE user_id=?", (entity_id,))
+            await db.execute("DELETE FROM users WHERE tg_id=?", (entity_id,))
+            await db.commit()
+        await cb.message.edit_text(f"🗑 Данные пользователя (ID {entity_id}) успешно удалены.")
+
+    elif entity_type == "curator":
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Получаем индекс удаляемого куратора
+            cur = await db.execute("SELECT idx, fio FROM curators WHERE telegram_id=?", (entity_id,))
+            row = await cur.fetchone()
+            if not row:
+                await cb.message.edit_text("❌ Куратор не найден.")
+                return
+            idx, fio = row
+
+            # Получаем список всех кураторов
+            cur = await db.execute("SELECT idx, telegram_id FROM curators ORDER BY idx")
+            all_cur = await cur.fetchall()
+
+            if len(all_cur) <= 1:
+                await cb.message.edit_text("⚠️ Нельзя удалить последнего куратора.")
+                return
+
+            # Определяем нового куратора для переназначения
+            ids = [c[0] for c in all_cur]
+            pos = ids.index(idx)
+            new_curator = all_cur[(pos + 1) % len(ids)]  # следующий по кругу
+            new_idx, new_tg = new_curator
+
+            # Обновляем пользователей
+            await db.execute("UPDATE users SET curator_idx=? WHERE curator_idx=?", (new_idx, idx))
+            await db.execute("DELETE FROM curators WHERE idx=?", (idx,))
+            await db.commit()
+
+        await cb.message.edit_text(
+            f"🗑 Куратор *{fio}* удалён.\n"
+            f"👥 Его участники переназначены куратору с ID {new_tg}.",
+            parse_mode="Markdown"
+        )
+
+    pending_deletions.pop(cb.from_user.id, None)
+    await cb.answer("Удаление выполнено ✅")
+
+
+# === Отмена удаления ===
+@dp.callback_query(lambda c: c.data == "cancel_delete")
+async def cancel_delete(cb: types.CallbackQuery):
+    pending_deletions.pop(cb.from_user.id, None)
+    await cb.message.edit_text("❎ Удаление отменено.")
+    await cb.answer("Действие отменено.")
+
 
 @dp.message(Command("gen_curator_link"))
 async def gen_curator_link(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id not in ADMIN_IDS:
         await message.answer("Эта команда доступна только администратору.")
         return
 
@@ -373,7 +531,7 @@ async def gen_curator_link(message: types.Message):
 
 @dp.message(Command("export"))
 async def cmd_export(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id not in ADMIN_IDS:
         await message.answer("Команда доступна только администратору.")
         return
     loop = asyncio.get_running_loop()
@@ -399,6 +557,61 @@ async def cmd_menu(message: types.Message):
     await cmd_tasks(message)
 
 
+@dp.message(Command("profile"))
+async def cmd_profile(message: types.Message):
+    tg_id = message.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Проверяем, зарегистрирован ли пользователь
+        cur = await db.execute("SELECT fio, acad_group, points FROM users WHERE tg_id=?", (tg_id,))
+        user = await cur.fetchone()
+        if not user:
+            await message.answer("❌ Вы ещё не зарегистрированы. Отправьте /start, чтобы начать.")
+            return
+
+        fio, acad_group, points = user
+
+        # Подсчитываем задания
+        cur_done = await db.execute("SELECT COUNT(*) FROM submissions WHERE user_id=? AND status='accepted'", (tg_id,))
+        done = (await cur_done.fetchone())[0]
+
+        cur_pending = await db.execute("SELECT COUNT(*) FROM submissions WHERE user_id=? AND status='pending'",
+                                       (tg_id,))
+        pending = (await cur_pending.fetchone())[0]
+
+    # Форматируем красивый вывод
+    profile_text = (
+        f"👤 *Твой профиль*\n\n"
+        f"📛 *ФИО:* {fio}\n"
+        f"🏫 *Группа:* {acad_group}\n"
+        f"⭐ *Баллы:* {points}\n\n"
+        f"📘 *Статистика заданий:*\n"
+        f"✅ Выполнено: {done}\n"
+        f"⏳ На проверке: {pending}\n"
+    )
+
+    await message.answer(profile_text, parse_mode="Markdown")
+
+
+# Команда админа посмотреть статистику кураторов
+@dp.message(Command('stats'))
+async def cmd_stats(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("Команда доступна только администратору")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT idx, fio, telegram_id FROM curators ORDER BY idx")
+        rows = await cur.fetchall()
+        lines = []
+        for r in rows:
+            idx, fio, tg = r
+            cur2 = await db.execute(
+                "SELECT COUNT(*) FROM submissions WHERE status='pending' AND user_id IN (SELECT tg_id FROM users WHERE curator_idx=?)",
+                (idx,))
+            pending = (await cur2.fetchone())[0]
+            lines.append(f"{fio} (idx={idx}, tg={tg}): {pending} pending")
+    await message.answer("\n".join(lines) if lines else "Кураторы не найдены")
+
+
 @dp.message(StartStates.waiting_for_fio)
 async def process_fio(message: types.Message, state: FSMContext):
     fio = message.text.strip()
@@ -421,15 +634,43 @@ async def process_group(message: types.Message, state: FSMContext):
                          (tg_id, fio, acad_group, curator_idx))
         await db.commit()
     await message.answer(
-        f"Регистрация завершена! Ваш куратор: {curator['fio'] if curator else 'не назначен'}.\nУдачи в конкурсе!")
-    # notify curator
+        f"✅ Регистрация завершена!\n"
+        f"Ваш куратор: {curator['fio'] if curator else 'не назначен'}.\n"
+        f"Удачи в конкурсе, {fio}!"
+    )
+
+    # уведомляем куратора
     if curator:
         await bot.send_message(curator['telegram_id'], f"Новый участник {fio} ({acad_group}) назначен вам на проверку.")
+
     await state.clear()
+
+    # краткое описание заданий с жирным форматированием
+    tasks_intro = (
+        "Спасибо! Ещё раз добро пожаловать на конкурс 🎉\n\n"
+        "Вот список заданий маршрутного листа и их краткое описание:\n\n"
+        "*1️⃣ Знакомство* — составить анкету о себе (ФИО с фото, номер группы, институт) и ответить на вопрос, почему я стал(а) старостой.\n\n"
+        "*2️⃣ Важные сведения* — чем занимается Второй отдел и где он находится?\n\n"
+        "*3️⃣ Документы и не только* — что такое ДРПО, чем занимается, как туда записаться?\n\n"
+        "*4️⃣ Дни варенья* — составить график дней рождения для своей группы.\n\n"
+        "*5️⃣ Памятный кадр* — сделать необычное фото всей группой, которое вы запомните надолго.\n\n"
+        "*6️⃣ Фото со звездой* — фото всей группы с преподавателем.\n\n"
+        "*7️⃣ Нетворкинг* — познакомьтесь с тремя старостами из других институтов и сделайте фото вместе.\n\n"
+        "*8️⃣ Красные дни календаря* — составьте красивое расписание коллоквиумов на семестр.\n\n"
+        "*9️⃣ Свети другим!* — снимите короткое доброе видео.\n\n"
+        "*🔟 Моё любимое!* — видео о вещах, которые вам нравятся в университете.\n\n"
+        "*1️⃣1️⃣ Расширь кругозор!* — посетите мероприятие и снимите видео-отчёт.\n\n"
+        "*1️⃣2️⃣ Проложи маршрут!* — создайте видео-маршрут.\n\n"
+        "*1️⃣3️⃣ Суперзадание* (доступно после выполнения ≥3 заданий) — с группой посетить кино/театр/квиз.\n\n"
+        "_С нетерпением ждём твоих ответов! 💪_"
+    )
+
+    await message.answer(tasks_intro, parse_mode="Markdown")
+
+    # после описания — показать список доступных заданий
     await message.answer(
-        f"Регистрация завершена! Ваш куратор: {curator['fio'] if curator else 'не назначен'}.\n"
-        "Вот список заданий:",
-        reply_markup=tasks_keyboard_for_user(tg_id)
+        "Теперь можешь выбрать первое задание 👇",
+        reply_markup=await tasks_keyboard_for_user(tg_id)
     )
 
 
@@ -461,23 +702,31 @@ async def on_task_selected(cb: types.CallbackQuery):
         await cb.answer("У вас уже есть решение этого задания на проверке.", show_alert=True)
         return
     t = task_by_id(task_id)
-    text = f"Задание {t['id']}. {t['title']}\nБаллы при подтверждении: {t['points']}\n\nИнструкция: ... (см. полное описание)"
-    await cb.message.edit_text(text, reply_markup=task_action_keyboard(task_id))
-    await cb.answer()
+    details = TASKS_DETAILS.get(task_id, {})
+    instruction = details.get("instruction", "Инструкция не найдена.")
+    text = (
+        f"*Задание {t['id']}. {t['title']}*\n"
+        f"Баллы при подтверждении: {t['points']}\n\n"
+        f"📘 *Инструкция:*\n{instruction}"
+    )
+    await cb.message.edit_text(text, parse_mode="Markdown", reply_markup=task_action_keyboard(task_id))
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith('hint_'))
 async def on_hint(cb: types.CallbackQuery):
     task_id = int(cb.data.split('_')[1])
     # For simplicity, hints are generic. In a real implementation put specific hints.
-    await cb.answer("Подсказка: воспользуйтесь идеями из описания задания.")
+    task_id = int(cb.data.split('_')[1])
+    hint = TASKS_DETAILS.get(task_id, {}).get("hint", "Подсказка недоступна.")
+    await cb.answer(f"💡 {hint}", show_alert=True)
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith('send_'))
 async def on_send_answer(cb: types.CallbackQuery, state: FSMContext):
     task_id = int(cb.data.split('_')[1])
     user_id = cb.from_user.id
-    # check same validations as above
+
+    # Проверки
     if await submission_accepted_for_task(user_id, task_id):
         await cb.answer("Вы уже выполнили это задание и оно зачтено.", show_alert=True)
         return
@@ -489,15 +738,33 @@ async def on_send_answer(cb: types.CallbackQuery, state: FSMContext):
         if accepted_count < 3:
             await cb.answer("Супер-задание доступно только после выполнения как минимум 3 заданий.", show_alert=True)
             return
+
+    # Получаем задание
     t = task_by_id(task_id)
-    if t["type"] == "photo_text":
+    required_type = t["type"]
+
+    # Определяем текст подсказки по типу
+    format_texts = {
+        "text": "✍️ Отправьте текстовый ответ:",
+        "photo": "📸 Отправьте фото:",
+        "video": "🎥 Отправьте видео:",
+        "photo_text": "📸 Сначала отправьте фото, затем ✍️ текстовое пояснение.",
+        "photo_multi": "📸 Отправьте несколько фото (можно подряд):",
+        "photo_video": "📸📹 Отправьте фото или видео:",
+    }
+    prompt = format_texts.get(required_type, "Отправьте ответ в нужном формате (текст/фото/видео):")
+
+    # Для photo_text — особый FSM
+    if required_type == "photo_text":
         await state.set_state(AnswerFSM.waiting_for_photo)
         await state.update_data(task_id=task_id)
-        await cb.message.answer("📸 Отправьте фото для этого задания:")
+        await cb.message.answer(prompt)
         await cb.answer()
         return
+
+    # Для всех остальных типов
     await state.update_data(task_id=task_id)
-    await cb.message.answer("Отправьте ответ в нужном формате (текст/фото/видео):")
+    await cb.message.answer(prompt)
     await state.set_state(SubmitStates.waiting_for_answer)
     await cb.answer()
 
@@ -574,47 +841,29 @@ async def notify_curator_new_answer(curator_tg: int, curator_idx: int):
     )
 
 
-# ===== студент отправил ответ =====
-@dp.message(SubmitStates.waiting_for_answer)
-async def receive_answer(message: types.Message, state: FSMContext):
+@dp.message(SubmitStates.waiting_for_answer, F.text.casefold() == "/done")
+async def handle_done_command(message: types.Message, state: FSMContext):
+    """
+    Завершает приём фото/видео для заданий типа photo_video.
+    """
     data = await state.get_data()
     task_id = data.get('task_id')
-    user_id = message.from_user.id
     t = task_by_id(task_id)
-    required = t['type']
+    user_id = message.from_user.id
 
-    is_text = bool(message.text and message.text.strip())
-    is_photo = bool(message.photo)
-    is_video = bool(message.video or message.video_note)
-
-    valid = False
-    content_type, content = None, None
-
-    if required == 'text' and is_text:
-        valid = True
-        content_type, content = 'text', message.text.strip()
-    elif required in ('photo', 'photo_text', 'photo_multi') and is_photo:
-        valid = True
-        content_type, content = 'photo', message.photo[-1].file_id
-    elif required == 'video' and is_video:
-        valid = True
-        content_type, content = 'video', (message.video or message.video_note).file_id
-    elif required == 'photo_video' and (is_photo or is_video):
-        valid = True
-        if is_photo:
-            content_type, content = 'photo', message.photo[-1].file_id
-        else:
-            content_type, content = 'video', message.video.file_id
-    elif required == 'photo_text' and (is_photo and is_text):
-        valid = True
-        content_type = 'photo_text'
-        content = f"photo:{message.photo[-1].file_id}|text:{message.text.strip()}"
-
-    if not valid:
-        await message.answer("Неподходящий тип ответа. Пожалуйста, отправьте в правильном формате.")
+    if t["type"] != "photo_video":
+        await message.answer("⚠️ Команда /done используется только для заданий с типом фото/видео.")
         return
 
+    collected = data.get("collected_media", [])
+    if not collected:
+        await message.answer("❗ Вы ещё не отправили ни одного фото или видео.")
+        return
+
+    content_type = "photo_video"
+    content = "|".join(collected)
     now = datetime.utcnow().isoformat()
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO submissions (user_id, task_id, status, content_type, content, created_at, updated_at) "
@@ -631,8 +880,112 @@ async def receive_answer(message: types.Message, state: FSMContext):
         c = await cur3.fetchone()
         curator_tg = c[0] if c else None
 
-    await message.answer("Ваш ответ отправлен на проверку куратору.")
+    await message.answer("✅ Все медиа получены и отправлены куратору.")
+    if curator_tg:
+        await notify_curator_new_answer(curator_tg, curator_idx)
 
+    await state.clear()
+
+
+@dp.message(SubmitStates.waiting_for_answer)
+async def receive_answer(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    task_id = data.get('task_id')
+    user_id = message.from_user.id
+    t = task_by_id(task_id)
+    required = t['type']
+    print(required)
+
+    is_text = bool(message.text and message.text.strip())
+    is_photo = bool(message.photo)
+    is_video = bool(message.video or message.video_note)
+    is_media_group = hasattr(message, "media_group_id")  # альбом (несколько фото/видео)
+
+    valid = False
+    content_type, content = None, None
+
+    # === text ===
+    if required == 'text' and is_text:
+        valid = True
+        content_type, content = 'text', message.text.strip()
+
+    # === photo / photo_multi ===
+    elif required in ('photo', 'photo_multi') and is_photo:
+        valid = True
+        content_type, content = 'photo', message.photo[-1].file_id
+
+    # === video ===
+    elif required == 'video' and is_video:
+        valid = True
+        content_type, content = 'video', (message.video or message.video_note).file_id
+
+    # === photo_text ===
+    elif required == 'photo_text' and (is_photo and is_text):
+        valid = True
+        content_type = 'photo_text'
+        content = f"photo:{message.photo[-1].file_id}|text:{message.text.strip()}"
+
+    # === photo_video (расширенный тип) ===
+    elif required == 'photo_video':
+        media_ids = []
+        if is_photo:
+            media_ids.append(f"photo:{message.photo[-1].file_id}")
+        if is_video:
+            vid = message.video or message.video_note
+            media_ids.append(f"video:{vid.file_id}")
+
+        # Проверяем, не альбом ли (несколько фото/видео)
+        if message.media_group_id:
+            # Сохраняем идентификаторы всех файлов из группы в FSM
+            prev_media = (await state.get_data()).get("collected_media", [])
+            prev_media += media_ids
+            await state.update_data(collected_media=prev_media)
+            await message.answer(
+                "📸 Медиа получено. Можешь отправить ещё фото или видео, либо напиши /done когда закончишь.")
+            return
+
+        # Если одиночное фото или видео — принимаем сразу
+        if media_ids:
+            valid = True
+            content_type = 'photo_video'
+            content = "|".join(media_ids)
+
+    # === Завершение отправки альбома (/done) ===
+    elif message.text and message.text.strip().lower() == "/done" and required == "photo_video":
+        collected = (await state.get_data()).get("collected_media", [])
+        if not collected:
+            await message.answer("❗ Вы ещё не отправили ни одного фото или видео.")
+            return
+        valid = True
+        content_type = "photo_video"
+        content = "|".join(collected)
+
+    # === Ошибка формата ===
+    if not valid:
+        print(message.text, message.text.strip().lower(), message.text and message.text.strip().lower() == "/done")
+        await message.answer("⚠️ Неподходящий тип ответа. Пожалуйста, отправьте фото, видео или несколько медиафайлов.")
+        return
+
+    now = datetime.utcnow().isoformat()
+
+    # === Запись в базу ===
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO submissions (user_id, task_id, status, content_type, content, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (user_id, task_id, 'pending', content_type, content, now, now),
+        )
+        await db.commit()
+
+        # получаем куратора
+        cur2 = await db.execute("SELECT curator_idx, fio FROM users WHERE tg_id=?", (user_id,))
+        u = await cur2.fetchone()
+        curator_idx, user_name = u[0], u[1]
+        cur3 = await db.execute("SELECT telegram_id FROM curators WHERE idx=?", (curator_idx,))
+        c = await cur3.fetchone()
+        curator_tg = c[0] if c else None
+
+    await message.answer("✅ Ваш ответ отправлен на проверку куратору.")
     if curator_tg:
         await notify_curator_new_answer(curator_tg, curator_idx)
 
@@ -649,45 +1002,90 @@ async def curator_start_check(cb: types.CallbackQuery):
 # ===== выдаём куратору следующий ответ =====
 async def send_next_submission_to_curator(curator_tg: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            SELECT s.id, s.user_id, s.task_id, s.content_type, s.content, u.fio
-            FROM submissions s
-            JOIN users u ON u.tg_id = s.user_id
-            WHERE s.status='pending' 
-              AND u.curator_idx=(SELECT idx FROM curators WHERE telegram_id=?)
-            ORDER BY s.created_at ASC
-            LIMIT 1
-        """, (curator_tg,))
-        row = await cur.fetchone()
+        while True:
+            cur = await db.execute("""
+                SELECT s.id, s.user_id, s.task_id, s.content_type, s.content, u.fio
+                FROM submissions s
+                JOIN users u ON u.tg_id = s.user_id
+                WHERE s.status='pending' 
+                  AND u.curator_idx=(SELECT idx FROM curators WHERE telegram_id=?)
+                ORDER BY s.created_at ASC
+                LIMIT 1
+            """, (curator_tg,))
+            row = await cur.fetchone()
 
-    if not row:
-        await bot.send_message(curator_tg, "Все задания проверены ✅")
-        asyncio.create_task(export_to_google_sheets())
-        return
+            # нет заданий
+            if not row:
+                await bot.send_message(curator_tg, "✅ Все задания проверены.")
+                asyncio.create_task(export_to_google_sheets())
+                return
 
-    submission_id, user_id, task_id, content_type, content, user_name = row
+            submission_id, user_id, task_id, content_type, content, user_name = row
+
+            # 🔍 проверяем, не зачтено ли уже это задание у пользователя
+            cur2 = await db.execute("""
+                SELECT COUNT(*) FROM submissions 
+                WHERE user_id=? AND task_id=? AND status='accepted'
+            """, (user_id, task_id))
+            already_accepted = (await cur2.fetchone())[0] > 0
+
+            if already_accepted:
+                # Удаляем дубликат, не показываем куратору
+                await db.execute("DELETE FROM submissions WHERE id=?", (submission_id,))
+                await db.commit()
+                continue  # берём следующее (если есть)
+
+            # если не зачтено — показываем куратору
+            break
+
+    # --- Отправляем контент ---
     t = task_by_id(task_id)
 
-    # отправляем контент
     if content_type == "text":
-        await bot.send_message(curator_tg, content)
+        await bot.send_message(curator_tg, f"📝 Ответ:\n{content}")
+
     elif content_type == "photo":
         await bot.send_photo(curator_tg, content)
+
     elif content_type == "video":
         await bot.send_video(curator_tg, content)
+
     elif content_type == "photo_text":
         parts = content.split("|")
         photo_id = parts[0].split(":")[1]
         text_msg = parts[1].split(":", 1)[1]
         await bot.send_photo(curator_tg, photo_id, caption=text_msg)
 
-    # инфо + кнопки
-    text = (
-        f"Задание {t['id']}. {t['title']}\n"
-        f"От участника: {user_name} (id: {user_id})\n"
-        f"Submission ID: {submission_id}"
+    elif content_type == "photo_video":
+        media_parts = content.split("|")
+        media_group = []
+        for part in media_parts:
+            if part.startswith("photo:"):
+                media_group.append(types.InputMediaPhoto(media=part.replace("photo:", "")))
+            elif part.startswith("video:"):
+                media_group.append(types.InputMediaVideo(media=part.replace("video:", "")))
+
+        if len(media_group) == 1:
+            m = media_group[0]
+            if isinstance(m, types.InputMediaPhoto):
+                await bot.send_photo(curator_tg, m.media)
+            elif isinstance(m, types.InputMediaVideo):
+                await bot.send_video(curator_tg, m.media)
+        elif len(media_group) > 1:
+            await bot.send_media_group(curator_tg, media=media_group)
+
+    info_text = (
+        f"📋 *Задание {t['id']}. {t['title']}*\n"
+        f"👤 От участника: {user_name}\n"
+        f"🆔 Submission ID: {submission_id}"
     )
-    await bot.send_message(curator_tg, text, reply_markup=curator_check_kb(submission_id))
+
+    await bot.send_message(
+        curator_tg,
+        info_text,
+        parse_mode="Markdown",
+        reply_markup=curator_check_kb(submission_id)
+    )
 
 
 # ===== куратор зачёл =====
@@ -698,6 +1096,7 @@ async def curator_accept(cb: types.CallbackQuery):
     now = datetime.utcnow().isoformat()
 
     async with aiosqlite.connect(DB_PATH) as db:
+        # Получаем данные о задании
         cur = await db.execute("SELECT user_id, task_id, status FROM submissions WHERE id=?", (submission_id,))
         row = await cur.fetchone()
         if not row:
@@ -705,12 +1104,32 @@ async def curator_accept(cb: types.CallbackQuery):
             return
 
         user_id, task_id, status = row
+
+        # Проверка: уже зачтено или нет
         if status != "pending":
             await cb.answer("Это задание уже проверено ⚠️", show_alert=True)
             return
 
-        # обновляем статус
-        await db.execute("UPDATE submissions SET status='accepted', updated_at=? WHERE id=?", (now, submission_id))
+        # Проверка: нет ли уже зачтённого варианта этого задания у пользователя
+        cur = await db.execute("""
+            SELECT COUNT(*) FROM submissions 
+            WHERE user_id=? AND task_id=? AND status='accepted'
+        """, (user_id, task_id))
+        already_accepted = (await cur.fetchone())[0] > 0
+        if already_accepted:
+            await db.execute(
+                "UPDATE submissions SET status='duplicate', updated_at=? WHERE id=?",
+                (now, submission_id),
+            )
+            await db.commit()
+            await cb.answer("⚠️ Это задание уже зачтено ранее. Баллы не начислены.", show_alert=True)
+            return
+
+        # Обновляем статус и начисляем баллы
+        await db.execute(
+            "UPDATE submissions SET status='accepted', updated_at=? WHERE id=?",
+            (now, submission_id),
+        )
         points = task_by_id(task_id)['points']
         await db.execute("UPDATE users SET points = points + ? WHERE tg_id=?", (points, user_id))
         await db.commit()
@@ -718,21 +1137,19 @@ async def curator_accept(cb: types.CallbackQuery):
         cur2 = await db.execute("SELECT points FROM users WHERE tg_id=?", (user_id,))
         new_points = (await cur2.fetchone())[0]
 
-    # уведомляем участника
-    await bot.send_message(user_id, f"Ваше задание {task_id} зачтено ✅. +{points} баллов. Всего: {new_points}")
+    # Уведомляем участника
+    await bot.send_message(user_id, f"✅ Ваше задание {task_id} зачтено. +{points} баллов. Всего: {new_points}")
 
-    # удаляем кнопки из старого сообщения
+    # Убираем кнопки у куратора
     try:
         await cb.message.edit_reply_markup()
     except TelegramBadRequest as e:
-        if "message is not modified" in str(e).lower():
-            pass
-        else:
+        if "message is not modified" not in str(e).lower():
             raise
 
-    await cb.answer("Задание зачтено ✅")
+    await cb.answer("✅ Задание зачтено")
 
-    # переходим к следующему
+    # После — перейти к следующему
     await send_next_submission_to_curator(curator_tg)
 
 
@@ -791,48 +1208,6 @@ async def handle_curator_reject_reason(message: types.Message, state: FSMContext
     await send_next_submission_to_curator(message.from_user.id)
 
 
-# Профиль пользователя
-@dp.message(Command("profile"))
-async def cmd_profile(message: types.Message):
-    tg = message.from_user.id
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT fio, acad_group, points FROM users WHERE tg_id=?", (tg,))
-        u = await cur.fetchone()
-        if not u:
-            await message.answer("Вы не зарегистрированы. Отправьте /start")
-            return
-        fio, acad_group, points = u
-        cur2 = await db.execute("SELECT COUNT(*) FROM submissions WHERE user_id=? AND status='accepted'", (tg,))
-        done = (await cur2.fetchone())[0]
-        cur3 = await db.execute("SELECT COUNT(*) FROM submissions WHERE user_id=? AND status='pending'", (tg,))
-        pend = (await cur3.fetchone())[0]
-        cur4 = await db.execute("SELECT COUNT(*) FROM submissions WHERE user_id=? AND status='rejected'", (tg,))
-        rej = (await cur4.fetchone())[0]
-    await message.answer(
-        f"Профиль:\nФИО: {fio}\nГруппа: {acad_group}\nБаллы: {points}\nРешено: {done}\nНа проверке: {pend}\nОтклонено: {rej}"
-    )
-
-
-# Команда админа посмотреть статистику кураторов
-@dp.message(Command('stats'))
-async def cmd_stats(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("Команда доступна только администратору")
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT idx, fio, telegram_id FROM curators ORDER BY idx")
-        rows = await cur.fetchall()
-        lines = []
-        for r in rows:
-            idx, fio, tg = r
-            cur2 = await db.execute(
-                "SELECT COUNT(*) FROM submissions WHERE status='pending' AND user_id IN (SELECT tg_id FROM users WHERE curator_idx=?)",
-                (idx,))
-            pending = (await cur2.fetchone())[0]
-            lines.append(f"{fio} (idx={idx}, tg={tg}): {pending} pending")
-    await message.answer("\n".join(lines) if lines else "Кураторы не найдены")
-
-
 def get_gs_client():
     scope = ["https://spreadsheets.google.com/feeds",
              "https://www.googleapis.com/auth/spreadsheets",
@@ -888,7 +1263,6 @@ async def export_to_google_sheets():
 
     except Exception as e:
         logging.error(f"❌ Ошибка при обновлении Google Sheets: {e}")
-
 
 
 async def on_startup(dp):
