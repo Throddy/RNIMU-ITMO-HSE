@@ -1,8 +1,8 @@
-aiofiles==23.1.0
-aiogram==3.0.0
+aiofiles==24.1.0
+aiogram==3.22.0
 aiogram.contrib==1.1.4
 aiohappyeyeballs==2.6.1
-aiohttp==3.8.6
+aiohttp==3.12.15
 aiosignal==1.4.0
 aiosqlite==0.21.0
 annotated-types==0.7.0
