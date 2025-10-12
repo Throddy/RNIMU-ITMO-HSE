@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  starosta-bot:
+    build: .
+    container_name: starosta-bot
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - ADMIN_IDS=${ADMIN_IDS}
+      - CURATORS_CSV=${CURATORS_CSV:-curators.csv}
+      - DB_PATH=${DB_PATH:-bot.db}
+      - SPREADSHEET_ID=${SPREADSHEET_ID}
+    volumes:
+      # Монтируем директорию для сохранения базы данных
+      - ./data:/app/data
+      # Монтируем файлы конфигурации (если нужно)
+      - ./curators.csv:/app/curators.csv:ro
+      - ./tasks_data.json:/app/tasks_data.json:ro
+      - ./credentials.json:/app/credentials.json:ro
+    # Если нужен доступ к порту
+    # ports:
+    #   - "8000:8000"
+    # Логи
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
