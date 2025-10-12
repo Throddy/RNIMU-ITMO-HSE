@@ -728,7 +728,7 @@ async def on_send_answer(cb: types.CallbackQuery, state: FSMContext):
     if await submission_pending_for_task(user_id, task_id):
         await cb.answer("У вас уже есть решение этого задания на проверке.", show_alert=True)
         return
-    if task_id == 13:
+    if task_id == 14:
         accepted_count = await user_has_accepted_count(user_id)
         if accepted_count < 3:
             await cb.answer("Супер-задание доступно только после выполнения как минимум 3 заданий.", show_alert=True)
@@ -905,8 +905,64 @@ async def receive_answer(message: types.Message, state: FSMContext):
 
     # === photo / photo_multi ===
     elif required in ('photo', 'photo_multi') and is_photo:
-        valid = True
-        content_type, content = 'photo', message.photo[-1].file_id
+        if required == 'photo':
+            # одиночное фото
+            valid = True
+            content_type = 'photo'
+            content = message.photo[-1].file_id
+        else:
+            # === сбор альбома ===
+            data = await state.get_data()
+            current_group_id = data.get("media_group_id")
+            collected = data.get("collected_photos", [])
+            group_id = message.media_group_id
+
+            # если новое media_group_id — сбрасываем коллекцию
+            if current_group_id != group_id:
+                collected = []
+                await state.update_data(media_group_id=group_id)
+
+            collected.append(message.photo[-1].file_id)
+            await state.update_data(collected_photos=collected)
+
+            # запускаем отложенную отправку альбома
+            async def finalize_album():
+                await asyncio.sleep(1.5)  # ждём пока Telegram дошлёт остальные фото
+                state_data = await state.get_data()
+                if state_data.get("media_group_id") == group_id:
+                    photos = state_data.get("collected_photos", [])
+                    if not photos:
+                        return
+                    valid_local = True
+                    content_type_local = "photo_multi"
+                    content_local = "|".join(f"photo:{pid}" for pid in photos)
+
+                    # очищаем временные данные
+                    await state.update_data(collected_photos=[], media_group_id=None)
+
+                    now = datetime.utcnow().isoformat()
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute(
+                            "INSERT INTO submissions (user_id, task_id, status, content_type, content, created_at, updated_at) "
+                            "VALUES (?,?,?,?,?,?,?)",
+                            (user_id, task_id, 'pending', content_type_local, content_local, now, now),
+                        )
+                        await db.commit()
+
+                        cur2 = await db.execute("SELECT curator_idx FROM users WHERE tg_id=?", (user_id,))
+                        curator_idx = (await cur2.fetchone())[0]
+                        cur3 = await db.execute("SELECT telegram_id FROM curators WHERE idx=?", (curator_idx,))
+                        curator_tg = (await cur3.fetchone())[0]
+
+                    await message.answer("✅ Ваш альбом успешно отправлен куратору на проверку.")
+                    await cmd_tasks(message)
+                    if curator_tg:
+                        await notify_curator_new_answer(curator_tg, curator_idx)
+                    await state.clear()
+
+            # запускаем сбор альбома в фоне
+            asyncio.create_task(finalize_album())
+            return
 
     # === video ===
     elif required == 'video' and is_video:
@@ -928,7 +984,6 @@ async def receive_answer(message: types.Message, state: FSMContext):
             media_ids.append(f"photo:{message.photo[-1].file_id}")
             prev_media = (await state.get_data()).get("collected_media", [])
             prev_media += media_ids
-            print(message.media_group_id, *prev_media, sep='\n')
             await state.update_data(collected_media=prev_media)
 
             if len(prev_media) < 10:
@@ -1086,6 +1141,17 @@ async def send_next_submission_to_curator(curator_tg: int):
         photo_id = parts[0].split(":")[1]
         text_msg = parts[1].split(":", 1)[1]
         await bot.send_photo(curator_tg, photo_id, caption=text_msg)
+
+    elif content_type == "photo_multi":
+        media_parts = content.split("|")
+        media_group = [
+            types.InputMediaPhoto(media=part.replace("photo:", ""))
+            for part in media_parts if part.startswith("photo:")
+        ]
+        if len(media_group) == 1:
+            await bot.send_photo(curator_tg, media_group[0].media)
+        elif len(media_group) > 1:
+            await bot.send_media_group(curator_tg, media=media_group)
 
     elif content_type == "photo_video":
         media_parts = content.split("|")
