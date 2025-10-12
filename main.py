@@ -37,11 +37,10 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import BotCommand
 from aiogram import F
-from aiogram import Router
 import aiosqlite
 from dotenv import load_dotenv
 import gspread
@@ -76,7 +75,7 @@ dp = Dispatcher(storage=MemoryStorage())
 
 # ---- Конфигурация заданий (соответствует документу пользователя) ----
 TASKS = [
-    {"id": 1, "title": "Знакомство", "type": "text", "points": 1},
+    {"id": 1, "title": "Знакомство", "type": "photo_text", "points": 1},
     {"id": 2, "title": "Важные сведения", "type": "text", "points": 1},
     {"id": 3, "title": "Документы и не только", "type": "text", "points": 1},
     {"id": 4, "title": "Дни варенья", "type": "text", "points": 1},
@@ -84,11 +83,12 @@ TASKS = [
     {"id": 6, "title": "Фото со звездой", "type": "photo", "points": 2},
     {"id": 7, "title": "Нетворкинг", "type": "photo_multi", "points": 2},
     {"id": 8, "title": "Красные дни календаря", "type": "photo", "points": 2},
-    {"id": 9, "title": "Свети другим!", "type": "video", "points": 3},
-    {"id": 10, "title": "Моё любимое!", "type": "video", "points": 3},
-    {"id": 11, "title": "Расширь кругозор!", "type": "video", "points": 3},
-    {"id": 12, "title": "Проложи маршрут!", "type": "video", "points": 3},
-    {"id": 13, "title": "Суперзадание", "type": "photo_video", "points": 10},
+    {"id": 9, "title": "Часть команды", "type": "photo", "points": 3},
+    {"id": 10, "title": "Свети другим!", "type": "video", "points": 3},
+    {"id": 11, "title": "Моё любимое!", "type": "video", "points": 3},
+    {"id": 12, "title": "Расширь кругозор!", "type": "video", "points": 3},
+    {"id": 13, "title": "Проложи маршрут!", "type": "video", "points": 3},
+    {"id": 14, "title": "Суперзадание", "type": "photo_video", "points": 10},
 ]
 
 
@@ -352,7 +352,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             )
             return
     await message.answer(
-        "Привет! Добро пожаловать в бот конкурса 'Староста года'! Для начала напишите, пожалуйста, свое ФИО."
+        "Привет! Добро пожаловать в бот конкурса «Староста года»! Для начала напишите, пожалуйста, свое ФИО:"
     )
     await state.set_state(StartStates.waiting_for_fio)
 
@@ -551,12 +551,6 @@ async def cmd_tasks(message: types.Message):
     )
 
 
-@dp.message(Command("menu"))
-async def cmd_menu(message: types.Message):
-    # просто вызываем обработчик tasks
-    await cmd_tasks(message)
-
-
 @dp.message(Command("profile"))
 async def cmd_profile(message: types.Message):
     tg_id = message.from_user.id
@@ -616,7 +610,7 @@ async def cmd_stats(message: types.Message):
 async def process_fio(message: types.Message, state: FSMContext):
     fio = message.text.strip()
     await state.update_data(fio=fio)
-    await message.answer("Спасибо! Теперь напишите, пожалуйста, номер своей академической группы.")
+    await message.answer("Спасибо! Теперь напишите, пожалуйста, номер своей академической группы:")
     await state.set_state(StartStates.waiting_for_group)
 
 
@@ -657,11 +651,12 @@ async def process_group(message: types.Message, state: FSMContext):
         "*6️⃣ Фото со звездой* — фото всей группы с преподавателем.\n\n"
         "*7️⃣ Нетворкинг* — познакомьтесь с тремя старостами из других институтов и сделайте фото вместе.\n\n"
         "*8️⃣ Красные дни календаря* — составьте красивое расписание коллоквиумов на семестр.\n\n"
-        "*9️⃣ Свети другим!* — снимите короткое доброе видео.\n\n"
-        "*🔟 Моё любимое!* — видео о вещах, которые вам нравятся в университете.\n\n"
-        "*1️⃣1️⃣ Расширь кругозор!* — посетите мероприятие и снимите видео-отчёт.\n\n"
-        "*1️⃣2️⃣ Проложи маршрут!* — создайте видео-маршрут.\n\n"
-        "*1️⃣3️⃣ Суперзадание* (доступно после выполнения ≥3 заданий) — с группой посетить кино/театр/квиз.\n\n"
+        "*9️⃣ Часть команды* — вступите в профсоюз студентов.\n\n"
+        "*🔟 Свети другим!* — снимите короткое доброе видео.\n\n"
+        "*1️⃣1️⃣ Моё любимое!* — видео о вещах, которые вам нравятся в университете.\n\n"
+        "*1️⃣2️⃣ Расширь кругозор!* — посетите мероприятие и снимите видео-отчёт.\n\n"
+        "*1️⃣3️⃣ Проложи маршрут!* — создайте видео-маршрут.\n\n"
+        "*1️⃣4️⃣ Суперзадание* (доступно после выполнения ≥3 заданий) — с группой посетить кино/театр/квиз.\n\n"
         "_С нетерпением ждём твоих ответов! 💪_"
     )
 
@@ -688,7 +683,7 @@ async def on_task_selected(cb: types.CallbackQuery):
     task_id = int(cb.data.split('_')[1])
     user_id = cb.from_user.id
     # check 13th availability
-    if task_id == 13:
+    if task_id == 14:
         accepted_count = await user_has_accepted_count(user_id)
         if accepted_count < 3:
             await cb.answer("Супер-задание доступно только после выполнения как минимум 3 заданий.", show_alert=True)
@@ -750,7 +745,7 @@ async def on_send_answer(cb: types.CallbackQuery, state: FSMContext):
         "video": "🎥 Отправьте видео:",
         "photo_text": "📸 Сначала отправьте фото, затем ✍️ текстовое пояснение.",
         "photo_multi": "📸 Отправьте несколько фото (можно подряд):",
-        "photo_video": "📸📹 Отправьте фото или видео:",
+        "photo_video": "📸📹 Отправьте не больше 10 фото или видео \n\n*Для отправки ответа на проверку используйте команду /done *",
     }
     prompt = format_texts.get(required_type, "Отправьте ответ в нужном формате (текст/фото/видео):")
 
@@ -764,7 +759,7 @@ async def on_send_answer(cb: types.CallbackQuery, state: FSMContext):
 
     # Для всех остальных типов
     await state.update_data(task_id=task_id)
-    await cb.message.answer(prompt)
+    await cb.message.answer(prompt, parse_mode="Markdown")
     await state.set_state(SubmitStates.waiting_for_answer)
     await cb.answer()
 
@@ -803,6 +798,7 @@ async def handle_text_for_task(message: types.Message, state: FSMContext):
         curator_tg = c[0] if c else None
 
     await message.answer("✅ Ваш ответ отправлен куратору.")
+    await cmd_tasks(message)
     if curator_tg:
         await notify_curator_new_answer(curator_tg, curator_idx)
 
@@ -894,8 +890,6 @@ async def receive_answer(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     t = task_by_id(task_id)
     required = t['type']
-    print(required)
-
     is_text = bool(message.text and message.text.strip())
     is_photo = bool(message.photo)
     is_video = bool(message.video or message.video_note)
@@ -928,27 +922,62 @@ async def receive_answer(message: types.Message, state: FSMContext):
     # === photo_video (расширенный тип) ===
     elif required == 'photo_video':
         media_ids = []
+
+        # Обработка фото
         if is_photo:
             media_ids.append(f"photo:{message.photo[-1].file_id}")
+            prev_media = (await state.get_data()).get("collected_media", [])
+            prev_media += media_ids
+            print(message.media_group_id, *prev_media, sep='\n')
+            await state.update_data(collected_media=prev_media)
+
+            if len(prev_media) < 10:
+                if not message.media_group_id:
+                    await message.answer(
+                        "📸 Медиа получено. Можете отправить ещё фото или видео, либо напишите /done когда закончите.\n\n"
+                        "*Суммарное количество всех отправленных фото/видео не должно быть больше 10!*",
+                        parse_mode="Markdown"
+                    )
+                return
+            else:
+                collected = prev_media[:10]
+                valid = True
+                content_type = "photo_video"
+                content = "|".join(collected)
+                await message.answer(
+                    "❗ Достигнут лимит в 10 медиафайлов!\n\nОтвет автоматически отправляется куратору на проверку!"
+                )
+
+        # Обработка видео
         if is_video:
             vid = message.video or message.video_note
             media_ids.append(f"video:{vid.file_id}")
-
-        # Проверяем, не альбом ли (несколько фото/видео)
-        if message.media_group_id:
-            # Сохраняем идентификаторы всех файлов из группы в FSM
             prev_media = (await state.get_data()).get("collected_media", [])
             prev_media += media_ids
             await state.update_data(collected_media=prev_media)
-            await message.answer(
-                "📸 Медиа получено. Можешь отправить ещё фото или видео, либо напиши /done когда закончишь.")
-            return
 
-        # Если одиночное фото или видео — принимаем сразу
-        if media_ids:
-            valid = True
-            content_type = 'photo_video'
-            content = "|".join(media_ids)
+            if len(prev_media) < 10:
+                if not message.media_group_id:
+                    await message.answer(
+                        "📸 Медиа получено. Можете отправить ещё фото или видео, либо напишите /done когда закончите.\n\n"
+                        "*Суммарное количество всех отправленных фото/видео не должно быть больше 10!*",
+                        parse_mode="Markdown"
+                    )
+                return
+            else:
+                collected = prev_media[:10]
+                valid = True
+                content_type = "photo_video"
+                content = "|".join(collected)
+                await message.answer(
+                    "❗ Достигнут лимит в 10 медиафайлов!\n\nОтвет автоматически отправляется куратору на проверку!"
+                )
+
+        # # Если одиночное фото или видео — принимаем сразу
+        # if media_ids:
+        #     valid = True
+        #     content_type = 'photo_video'
+        #     content = "|".join(media_ids)
 
     # === Завершение отправки альбома (/done) ===
     elif message.text and message.text.strip().lower() == "/done" and required == "photo_video":
@@ -956,13 +985,14 @@ async def receive_answer(message: types.Message, state: FSMContext):
         if not collected:
             await message.answer("❗ Вы ещё не отправили ни одного фото или видео.")
             return
+        if len(collected) > 10:
+            collected = collected[:10]
         valid = True
         content_type = "photo_video"
         content = "|".join(collected)
 
     # === Ошибка формата ===
     if not valid:
-        print(message.text, message.text.strip().lower(), message.text and message.text.strip().lower() == "/done")
         await message.answer("⚠️ Неподходящий тип ответа. Пожалуйста, отправьте фото, видео или несколько медиафайлов.")
         return
 
@@ -986,6 +1016,7 @@ async def receive_answer(message: types.Message, state: FSMContext):
         curator_tg = c[0] if c else None
 
     await message.answer("✅ Ваш ответ отправлен на проверку куратору.")
+    await cmd_tasks(message)
     if curator_tg:
         await notify_curator_new_answer(curator_tg, curator_idx)
 
@@ -1273,7 +1304,6 @@ async def on_startup(dp):
     commands = [
         BotCommand(command="start", description="Начать работу"),
         BotCommand(command="tasks", description="Список заданий"),
-        BotCommand(command="menu", description="Главное меню"),
         BotCommand(command="profile", description="Мой профиль"),
     ]
     await bot.set_my_commands(commands)
