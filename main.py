@@ -47,6 +47,11 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from aiogram.exceptions import TelegramBadRequest
 import secrets
+import zipfile
+import aiofiles
+import aiofiles.os
+import aiohttp
+from datetime import timedelta
 
 logging.basicConfig(level=logging.INFO)
 
@@ -60,6 +65,9 @@ SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
 SPREADSHEET_NAME = "Староста года"  # название таблицы
 SHEET_NAME = "Рейтинг"  # лист для рейтинга
 TASKS_JSON_PATH = "tasks_data.json"
+BACKUP_DIR = "backups"
+BACKUP_INTERVAL_HOURS = 24
+LOG_FILE = "all_logs.txt"
 
 if not os.path.exists(TASKS_JSON_PATH):
     raise FileNotFoundError(f"Файл {TASKS_JSON_PATH} не найден")
@@ -90,6 +98,107 @@ TASKS = [
     {"id": 13, "title": "Проложи маршрут!", "type": "video", "points": 3},
     {"id": 14, "title": "Суперзадание", "type": "photo_video", "points": 10},
 ]
+
+class BroadcastState(StatesGroup):
+    waiting_for_message = State()
+
+# === Настраиваем логирование (чтобы точно писалось в файл) ===
+if not os.path.exists(LOG_FILE):
+    open(LOG_FILE, "a").close()
+file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+file_handler.setFormatter(formatter)
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+if not any(isinstance(h, logging.FileHandler) for h in root_logger.handlers):
+    root_logger.addHandler(file_handler)
+
+
+async def create_backup() -> str:
+    """Создает zip-бэкап базы данных, логов и конфигов."""
+    if not os.path.exists(BACKUP_DIR):
+        os.makedirs(BACKUP_DIR)
+
+    # Принудительно сбрасываем буфер логов перед архивированием
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.FileHandler):
+            handler.flush()
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_name = f"backup_{timestamp}.zip"
+    backup_path = os.path.join(BACKUP_DIR, backup_name)
+
+    with zipfile.ZipFile(backup_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        if os.path.exists(DB_PATH):
+            zf.write(DB_PATH, arcname="bot.db")
+        if os.path.exists(LOG_FILE):
+            zf.write(LOG_FILE, arcname="all_logs.txt")
+        if os.path.exists("curators.csv"):
+            zf.write("curators.csv", arcname="curators.csv")
+        if os.path.exists("credentials.json"):
+            zf.write("credentials.json", arcname="credentials.json")
+
+    logging.info(f"📦 Бэкап создан: {backup_path}")
+    return backup_path
+
+
+async def send_backup_to_admin():
+    """Отправляет бэкап админу и удаляет файл после отправки."""
+    if not ADMIN_IDS:
+        logging.warning("⚠️ Нет ADMIN_IDS — некуда отправлять бэкап.")
+        return
+
+    admin_id = ADMIN_IDS[0]
+    backup_path = await create_backup()
+
+    try:
+        await bot.send_document(admin_id, types.FSInputFile(backup_path),
+                                caption=f"📦 Автоматический бэкап ({datetime.now():%d.%m %H:%M})")
+        logging.info(f"✅ Бэкап отправлен админу {admin_id}")
+    except Exception as e:
+        logging.error(f"❌ Не удалось отправить бэкап админу: {e}")
+    finally:
+        try:
+            os.remove(backup_path)
+            logging.info(f"🗑 Бэкап удалён: {backup_path}")
+        except Exception as e:
+            logging.warning(f"⚠️ Не удалось удалить бэкап: {e}")
+
+
+async def backup_scheduler():
+    """Фоновая задача: создаёт и отправляет бэкапы каждые BACKUP_INTERVAL_HOURS."""
+    while True:
+        try:
+            await send_backup_to_admin()
+        except Exception as e:
+            logging.error(f"Ошибка при создании/отправке бэкапа: {e}")
+        await asyncio.sleep(BACKUP_INTERVAL_HOURS * 3600)
+
+
+@dp.message(Command("logs"))
+async def cmd_logs(message: types.Message):
+    """Создает свежий бэкап (включая логи) и отправляет админу."""
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ Команда доступна только главным администраторам.")
+        return
+
+    await message.answer("⏳ Создаю и отправляю свежий бэкап с логами...")
+
+    backup_path = None
+    try:
+        backup_path = await create_backup()
+        await bot.send_document(message.from_user.id, types.FSInputFile(backup_path),
+                                caption=f"📦 Бэкап + логи ({datetime.now():%d.%m %H:%M})")
+        await message.answer("✅ Бэкап с логами отправлен и удалён.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при отправке бэкапа: {e}")
+    finally:
+        if backup_path and os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+                logging.info(f"🗑 Бэкап {backup_path} удалён после ручной отправки.")
+            except Exception as e:
+                logging.warning(f"⚠️ Не удалось удалить бэкап: {e}")
 
 
 async def tasks_keyboard_for_user(user_id: int) -> InlineKeyboardMarkup:
@@ -606,6 +715,70 @@ async def cmd_stats(message: types.Message):
     await message.answer("\n".join(lines) if lines else "Кураторы не найдены")
 
 
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message, state: FSMContext):
+    """Команда для начала рассылки всем пользователям"""
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ Команда доступна только главным администраторам.")
+        return
+
+    await message.answer("✉️ Введите текст рассылки, который хотите отправить всем пользователям.\n\n"
+                         "_Можно использовать форматирование Markdown._", parse_mode="Markdown")
+    await state.set_state(BroadcastState.waiting_for_message)
+
+
+@dp.message(BroadcastState.waiting_for_message)
+async def process_broadcast_message(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    await state.clear()
+
+    if not text:
+        await message.answer("⚠️ Текст рассылки не может быть пустым.")
+        return
+
+    await message.answer("🚀 Начинаю рассылку всем пользователям...")
+
+    delivered = 0
+    failed = 0
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT tg_id FROM users")
+        all_users = [r[0] for r in await cur.fetchall()]
+
+    total = len(all_users)
+    if total == 0:
+        await message.answer("❌ Нет зарегистрированных пользователей для рассылки.")
+        return
+
+    # Отправляем по очереди с небольшой задержкой (чтобы не словить flood limit)
+    for i, user_id in enumerate(all_users, 1):
+        try:
+            await bot.send_message(user_id, text, parse_mode="Markdown")
+            delivered += 1
+        except Exception as e:
+            logging.warning(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
+            failed += 1
+
+        # обновляем статус каждые 10 сообщений
+        if i % 10 == 0 or i == total:
+            try:
+                await message.answer(f"📬 Рассылка: {i}/{total} обработано "
+                                     f"(✅ {delivered}, ❌ {failed})")
+            except Exception:
+                pass  # чтобы не спамил в консоль
+
+        await asyncio.sleep(0.2)  # минимальная пауза между отправками
+
+    summary = (
+        f"✅ Рассылка завершена!\n\n"
+        f"📤 Отправлено: {delivered}\n"
+        f"⚠️ Ошибок: {failed}\n"
+        f"👥 Всего пользователей: {total}"
+    )
+    await message.answer(summary)
+    logging.info(summary)
+
+
 @dp.message(StartStates.waiting_for_fio)
 async def process_fio(message: types.Message, state: FSMContext):
     fio = message.text.strip()
@@ -642,6 +815,8 @@ async def process_group(message: types.Message, state: FSMContext):
     # краткое описание заданий с жирным форматированием
     tasks_intro = (
         "Спасибо! Ещё раз добро пожаловать на конкурс 🎉\n\n"
+        "*Обязательно подпишись на канал тех. поддержки бота: @SG_RNIMU_tech *\n\n"
+        "Там важные объявления, связанные с работой бота, а также там можно задать вопрос тех. поддержке\n\n"
         "Вот список заданий маршрутного листа и их краткое описание:\n\n"
         "*1️⃣ Знакомство* — составить анкету о себе (ФИО с фото, номер группы, институт) и ответить на вопрос, почему я стал(а) старостой.\n\n"
         "*2️⃣ Важные сведения* — чем занимается Второй отдел и где он находится?\n\n"
@@ -1048,7 +1223,7 @@ async def receive_answer(message: types.Message, state: FSMContext):
 
     # === Ошибка формата ===
     if not valid:
-        await message.answer("⚠️ Неподходящий тип ответа. Пожалуйста, отправьте фото, видео или несколько медиафайлов.")
+        await message.answer("⚠️ Неподходящий тип ответа. Пожалуйста, отправьте ответ с подходящим типом!")
         return
 
     now = datetime.utcnow().isoformat()
@@ -1124,23 +1299,68 @@ async def send_next_submission_to_curator(curator_tg: int):
             # если не зачтено — показываем куратору
             break
 
-    # --- Отправляем контент ---
     t = task_by_id(task_id)
 
+    async def safe_send_captioned_photo(chat_id: int, photo_id: str, caption: str):
+        # Telegram caption limit ≈ 1024. Обрезаем и отправляем остаток отдельным сообщением.
+        if not caption:
+            await bot.send_photo(chat_id, photo_id)
+            return
+        caption_to_send = caption[:1024]
+        remainder = caption[1024:]
+        try:
+            await bot.send_photo(chat_id, photo_id, caption=caption_to_send)
+        except TelegramBadRequest:
+            # если с caption не получилось, отправим фото без caption
+            await bot.send_photo(chat_id, photo_id)
+            # и отправим caption как текст (в кусках по 4000)
+            if caption_to_send:
+                for i in range(0, len(caption), 4000):
+                    await bot.send_message(chat_id, caption[i:i + 4000])
+            return
+        # если был остаток — отправляем как отдельный текст
+        if remainder:
+            for i in range(0, len(remainder), 4000):
+                await bot.send_message(chat_id, remainder[i:i + 4000])
+
+    async def safe_send_media_group(chat_id: int, media_list: List[types.InputMedia]):
+        try:
+            await bot.send_media_group(chat_id, media=media_list)
+        except TelegramBadRequest as e:
+            # fallback: отправляем по одному элементу (без caption)
+            for m in media_list:
+                try:
+                    if isinstance(m, types.InputMediaPhoto):
+                        await bot.send_photo(chat_id, m.media)
+                    elif isinstance(m, types.InputMediaVideo):
+                        await bot.send_video(chat_id, m.media)
+                except Exception:
+                    logging.exception("Ошибка при fallback-отправке медиа куратору")
+
+    # отправка в зависимости от типа
     if content_type == "text":
-        await bot.send_message(curator_tg, f"📝 Ответ:\n{content}")
+        try:
+            await bot.send_message(curator_tg, f"📝 Ответ:\n{content}")
+        except Exception:
+            logging.exception("Failed to send text to curator")
 
     elif content_type == "photo":
-        await bot.send_photo(curator_tg, content)
+        text_msg = ""  # если нужно: получить подпись из БД/других полей
+        await safe_send_captioned_photo(curator_tg, content, text_msg)
 
     elif content_type == "video":
-        await bot.send_video(curator_tg, content)
+        try:
+            await bot.send_video(curator_tg, content)
+        except TelegramBadRequest:
+            # если ошибка — отправим ссылку/ид без подписи
+            await bot.send_message(curator_tg,
+                                   "Не удалось отправить видео напрямую. Пожалуйста, проверьте исходный файл.")
 
     elif content_type == "photo_text":
         parts = content.split("|")
         photo_id = parts[0].split(":")[1]
-        text_msg = parts[1].split(":", 1)[1]
-        await bot.send_photo(curator_tg, photo_id, caption=text_msg)
+        text_msg = parts[1].split(":", 1)[1] if len(parts) > 1 else ""
+        await safe_send_captioned_photo(curator_tg, photo_id, text_msg)
 
     elif content_type == "photo_multi":
         media_parts = content.split("|")
@@ -1151,7 +1371,7 @@ async def send_next_submission_to_curator(curator_tg: int):
         if len(media_group) == 1:
             await bot.send_photo(curator_tg, media_group[0].media)
         elif len(media_group) > 1:
-            await bot.send_media_group(curator_tg, media=media_group)
+            await safe_send_media_group(curator_tg, media_group)
 
     elif content_type == "photo_video":
         media_parts = content.split("|")
@@ -1161,7 +1381,6 @@ async def send_next_submission_to_curator(curator_tg: int):
                 media_group.append(types.InputMediaPhoto(media=part.replace("photo:", "")))
             elif part.startswith("video:"):
                 media_group.append(types.InputMediaVideo(media=part.replace("video:", "")))
-
         if len(media_group) == 1:
             m = media_group[0]
             if isinstance(m, types.InputMediaPhoto):
@@ -1169,7 +1388,7 @@ async def send_next_submission_to_curator(curator_tg: int):
             elif isinstance(m, types.InputMediaVideo):
                 await bot.send_video(curator_tg, m.media)
         elif len(media_group) > 1:
-            await bot.send_media_group(curator_tg, media=media_group)
+            await safe_send_media_group(curator_tg, media_group)
 
     info_text = (
         f"📋 *Задание {t['id']}. {t['title']}*\n"
@@ -1365,6 +1584,7 @@ async def export_to_google_sheets():
 async def on_startup(dp):
     await init_db()
     await load_curators_from_csv_if_empty()
+    asyncio.create_task(backup_scheduler())
 
     # регистрируем команды для удобства
     commands = [
