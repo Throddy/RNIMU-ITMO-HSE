@@ -277,6 +277,7 @@ async def init_db():
             created_at TEXT,
             updated_at TEXT
         )""")
+        await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('next_curator_idx', '1')")
         await db.commit()
 
 
