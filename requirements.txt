@@ -36,6 +36,6 @@ rsa==4.9.1
 six==1.17.0
 SQLAlchemy==2.0.43
 typing-inspection==0.4.1
-typing_extensions==4.7.1
+typing_extensions==4.12.2
 urllib3==2.5.0
 yarl==1.20.1
