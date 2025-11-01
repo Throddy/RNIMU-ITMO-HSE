@@ -25,7 +25,6 @@ Telegram bot для конкурса "Староста года" на aiogram (v
 """
 
 import asyncio
-import csv
 import os
 from datetime import datetime
 from typing import List, Optional
@@ -48,10 +47,6 @@ from oauth2client.service_account import ServiceAccountCredentials
 from aiogram.exceptions import TelegramBadRequest
 import secrets
 import zipfile
-import aiofiles
-import aiofiles.os
-import aiohttp
-from datetime import timedelta
 
 logging.basicConfig(level=logging.INFO)
 
@@ -99,8 +94,10 @@ TASKS = [
     {"id": 14, "title": "Суперзадание", "type": "photo_video", "points": 10},
 ]
 
+
 class BroadcastState(StatesGroup):
     waiting_for_message = State()
+
 
 # === Настраиваем логирование (чтобы точно писалось в файл) ===
 if not os.path.exists(LOG_FILE):
@@ -280,30 +277,6 @@ async def init_db():
         await db.commit()
 
 
-async def load_curators_from_csv_if_empty():
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM curators")
-        r = await cur.fetchone()
-        if r[0] == 0:
-            # load from CSV
-            if not os.path.exists(CURATORS_CSV):
-                print(f"curators csv ({CURATORS_CSV}) not found. Create it with fio,telegram_id")
-                return
-            with open(CURATORS_CSV, encoding='utf-8') as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    if not row:
-                        continue
-                    cor_row = row[0].split(',')
-                    fio = cor_row[0].strip()
-                    tg = int(cor_row[1].strip())
-                    await db.execute("INSERT INTO curators (fio, telegram_id) VALUES (?,?)", (fio, tg))
-            # set meta next_curator_idx
-            await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('next_curator_idx', '1')")
-            await db.commit()
-            print("Curators loaded from CSV")
-
-
 async def update_google_sheet():
     # подключаемся к Google Sheets
     scope = [
@@ -477,6 +450,93 @@ def confirm_keyboard(entity_type: str, entity_id: int) -> InlineKeyboardMarkup:
     kb.button(text="❌ Отмена", callback_data="cancel_delete")
     kb.adjust(2)
     return kb.as_markup()
+
+
+async def is_submissions_closed() -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT value FROM meta WHERE key='submissions_closed'")
+        row = await cur.fetchone()
+        return row and row[0] == "true"
+
+
+# === Команда админа: включить/выключить приём заданий ===
+@dp.message(Command("stop_submissions"))
+async def cmd_stop_submissions(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ Команда доступна только администратору.")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT value FROM meta WHERE key='submissions_closed'")
+        row = await cur.fetchone()
+        closed = row and row[0] == "true"
+
+        new_state = "false" if closed else "true"
+        await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('submissions_closed', ?)", (new_state,))
+        await db.commit()
+
+    if new_state == "true":
+        await message.answer("🚫 Приём заданий остановлен. Бот больше не принимает ответы от участников.")
+        logging.info("⚠️ Приём заданий остановлен администратором.")
+    else:
+        await message.answer("✅ Приём заданий возобновлён.")
+        logging.info("✅ Приём заданий возобновлён администратором.")
+
+
+@dp.message(Command("check_unlinked"))
+async def cmd_check_unlinked(message: types.Message):
+    """Команда для проверки ответов от незарегистрированных пользователей или без куратора"""
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ Команда доступна только администраторам.")
+        return
+
+    await message.answer("🔍 Проверяю базу на наличие неподключённых пользователей...")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # --- 1️⃣ Пользователи, которых нет в таблице users, но есть submissions ---
+        cur = await db.execute("""
+            SELECT DISTINCT s.user_id 
+            FROM submissions s
+            LEFT JOIN users u ON s.user_id = u.tg_id
+            WHERE u.tg_id IS NULL
+        """)
+        not_registered = [r[0] for r in await cur.fetchall()]
+
+        # --- 2️⃣ Пользователи, у которых нет куратора ---
+        cur = await db.execute("""
+            SELECT tg_id 
+            FROM users 
+            WHERE curator_idx IS NULL OR curator_idx = ''
+        """)
+        no_curator = [r[0] for r in await cur.fetchall()]
+
+    total_notified = 0
+    failed = 0
+
+    # --- Отправляем уведомления пользователям ---
+    for uid in set(not_registered + no_curator):
+        try:
+            await bot.send_message(
+                uid,
+                "⚠️ Вы ещё не зарегистрированы или у вас не назначен куратор.\n\n"
+                "Пожалуйста, обратитесь в техподдержку: @SG_RNIMU_tech"
+            )
+            total_notified += 1
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logging.warning(f"Не удалось отправить уведомление пользователю {uid}: {e}")
+            failed += 1
+
+    summary = (
+        f"📊 Проверка завершена!\n\n"
+        f"👤 Не зарегистрированы: {len(not_registered)}\n"
+        f"👥 Без куратора: {len(no_curator)}\n"
+        f"📩 Уведомлено: {total_notified}\n"
+        f"⚠️ Ошибок при отправке: {failed}"
+    )
+
+    await message.answer(summary)
+    logging.info(summary)
 
 
 # === Команда: удалить пользователя ===
@@ -897,6 +957,32 @@ async def on_send_answer(cb: types.CallbackQuery, state: FSMContext):
     user_id = cb.from_user.id
 
     # Проверки
+    if await is_submissions_closed():
+        await cb.answer("🚫 Приём заданий завершён. Спасибо за участие!", show_alert=True)
+        return
+    # --- Проверяем, зарегистрирован ли пользователь и есть ли у него куратор ---
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT curator_idx FROM users WHERE tg_id=?", (user_id,))
+        row = await cur.fetchone()
+
+        if not row:
+            await cb.answer(
+                "🚫 Вы ещё не зарегистрированы!\n\n"
+                "Используйте команду /start для регистрации.\n\n"
+                "Также подпишитесь на канал поддержки @SG_RNIMU_tech — там публикуются важные объявления "
+                "и можно задать вопрос техподдержке.",
+                show_alert=True
+            )
+            return
+
+        curator_idx = row[0]
+        if curator_idx is None:
+            await cb.answer(
+                "⚠️ У вас пока не назначен куратор. Пожалуйста, обратитесь в техподдержку @SG_RNIMU_tech",
+                show_alert=True
+            )
+            return
+
     if await submission_accepted_for_task(user_id, task_id):
         await cb.answer("Вы уже выполнили это задание и оно зачтено.", show_alert=True)
         return
@@ -1583,7 +1669,6 @@ async def export_to_google_sheets():
 
 async def on_startup(dp):
     await init_db()
-    await load_curators_from_csv_if_empty()
     asyncio.create_task(backup_scheduler())
 
     # регистрируем команды для удобства
@@ -1598,7 +1683,6 @@ async def on_startup(dp):
 # Запуск
 async def main():
     await init_db()
-    await load_curators_from_csv_if_empty()
     await on_startup(dp)
     print("Bot started")
     try:

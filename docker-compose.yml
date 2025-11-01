@@ -9,19 +9,14 @@ services:
       - BOT_TOKEN=${BOT_TOKEN}
       - ADMIN_IDS=${ADMIN_IDS}
       - CURATORS_CSV=${CURATORS_CSV:-curators.csv}
-      - DB_PATH=${DB_PATH:-bot.db}
+      - DB_PATH=/app/data/bot.db        # 👈 база в отдельной директории
       - SPREADSHEET_ID=${SPREADSHEET_ID}
     volumes:
-      # Монтируем директорию для сохранения базы данных
-      - ./data:/app/data
-      # Монтируем файлы конфигурации (если нужно)
+      # сохраняем данные вне контейнера
+      - ./data:/app/data                # 👈 монтируем локальную папку для базы
       - ./curators.csv:/app/curators.csv:ro
       - ./tasks_data.json:/app/tasks_data.json:ro
       - ./credentials.json:/app/credentials.json:ro
-    # Если нужен доступ к порту
-    # ports:
-    #   - "8000:8000"
-    # Логи
     logging:
       driver: "json-file"
       options:
